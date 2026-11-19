@@ -1,0 +1,890 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>LawnMap</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+  :root { --bg:#14181c; --panel:#1c2228; --line:#2c343c; --text:#e8edf1; --dim:#93a0ab; --accent:#3ddc84; --accent-ink:#06260f; --warn:#ffb454; }
+  * { box-sizing:border-box; }
+  html, body { height:100%; margin:0; }
+  body { display:flex; font:14px/1.4 system-ui, "Segoe UI", sans-serif; color:var(--text); background:var(--bg); }
+  #side { width:340px; flex:none; display:flex; flex-direction:column; background:var(--panel); border-right:1px solid var(--line); overflow-y:auto; }
+  #map { flex:1; background:#0b0d0f; }
+  header { padding:14px 16px 6px; font-size:18px; font-weight:700; letter-spacing:.2px; }
+  header span { color:var(--accent); }
+  section { padding:12px 16px; border-top:1px solid var(--line); }
+  section:first-of-type { border-top:0; }
+  h2 { margin:0 0 8px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.8px; color:var(--dim); }
+  input[type=text] { width:100%; padding:9px 10px; border-radius:6px; border:1px solid var(--line); background:#0f1317; color:var(--text); font:inherit; }
+  input[type=text]:focus { outline:2px solid var(--accent); outline-offset:-1px; }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  input[type=checkbox] { accent-color:var(--accent); }
+  #suggest { position:relative; }
+  #suggest ul { position:absolute; z-index:2000; left:0; right:0; margin:4px 0 0; padding:4px; list-style:none; background:#0f1317; border:1px solid var(--line); border-radius:6px; box-shadow:0 8px 24px #0008; }
+  #suggest li { padding:7px 8px; border-radius:4px; cursor:pointer; font-size:13px; }
+  #suggest li:hover, #suggest li.on { background:#243038; }
+  button { font:inherit; color:var(--text); background:#26303a; border:1px solid var(--line); border-radius:6px; padding:7px 10px; cursor:pointer; }
+  button:hover { background:#2f3b46; }
+  button:disabled { opacity:.45; cursor:default; }
+  button.primary, button.on { background:var(--accent); color:var(--accent-ink); border-color:transparent; font-weight:600; }
+  .row { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+  .row > button { flex:1; white-space:nowrap; }
+  .gap { margin-top:8px; }
+  #status { min-height:20px; font-size:13px; color:var(--dim); margin-top:8px; }
+  #status.err { color:var(--warn); }
+  #addr { font-weight:600; }
+  #meta { color:var(--dim); font-size:12px; }
+  #big { font-size:34px; font-weight:700; color:var(--accent); line-height:1.1; margin-top:8px; font-variant-numeric:tabular-nums; }
+  #big small { font-size:14px; font-weight:500; color:var(--dim); }
+  #sub { color:var(--dim); font-size:13px; font-variant-numeric:tabular-nums; }
+  label.chk { display:flex; gap:8px; align-items:center; margin-top:6px; cursor:pointer; }
+  label.sl { display:flex; justify-content:space-between; color:var(--dim); font-size:12px; margin-top:8px; }
+  .zone { display:flex; align-items:center; gap:8px; padding:7px 8px; border:1px solid transparent; border-radius:6px; cursor:pointer; }
+  .zone:hover { background:#222b33; }
+  .zone.active { border-color:var(--accent); background:#1f2a31; }
+  .zone .sw { width:14px; height:14px; border-radius:3px; flex:none; }
+  .zone .zn { flex:1; font-weight:600; }
+  .zone .za { color:var(--dim); font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .zone.off .zn, .zone.off .za { opacity:.5; text-decoration:line-through; }
+  #saved { list-style:none; margin:0; padding:0; }
+  #saved li { display:flex; justify-content:space-between; gap:8px; padding:7px 0; border-bottom:1px solid var(--line); cursor:pointer; font-size:13px; }
+  #saved li:hover .a { color:var(--accent); }
+  #saved .n { color:var(--dim); white-space:nowrap; font-variant-numeric:tabular-nums; }
+  #saved .x { color:var(--dim); padding:0 4px; }
+  #saved .x:hover { color:var(--warn); }
+  .hint { color:var(--dim); font-size:12px; margin-top:8px; }
+  .hide { display:none !important; }
+  .leaflet-container { font:inherit; }
+  .lm-overlay { image-rendering:pixelated; pointer-events:none; }
+  body.tool-brush #map, body.tool-poly #map, body.tool-pick #map { cursor:crosshair; }
+  @media (max-width: 760px) { body { flex-direction:column-reverse; } #side { width:100%; height:48%; border-right:0; border-top:1px solid var(--line); } }
+</style>
+</head>
+<body>
+<aside id="side">
+  <header>Lawn<span>Map</span></header>
+
+  <section>
+    <div id="suggest">
+      <input id="q" type="text" placeholder="Search a North Carolina address…" autocomplete="off" spellcheck="false">
+      <ul id="sugg" class="hide"></ul>
+    </div>
+    <div class="row gap">
+      <button id="pick">Pick property on map</button>
+      <button id="lines">Property lines</button>
+    </div>
+    <div id="status">Search an address to measure its lawn.</div>
+  </section>
+
+  <section id="propSec" class="hide">
+    <h2>Property</h2>
+    <div id="addr"></div>
+    <div id="meta"></div>
+    <div id="big">–</div>
+    <div id="sub"></div>
+    <div class="row gap">
+      <button id="save" class="primary">Save</button>
+      <button id="png">Download map</button>
+    </div>
+  </section>
+
+  <section id="zoneSec" class="hide">
+    <h2>Yard zones</h2>
+    <div id="zones"></div>
+    <div class="row gap">
+      <button id="zAdd">+ Add zone</button>
+      <button id="zSplit" title="Re-split the lawn into Front and Back using the street side of the house">Split front / back</button>
+    </div>
+    <div class="hint">Click a zone to work in it. Untick a zone to leave it out of the total. Double-click a name to rename.</div>
+  </section>
+
+  <section id="detSec" class="hide">
+    <h2>Auto-detect</h2>
+    <label class="sl"><span>Less grass</span><span>Sensitivity</span><span>More grass</span></label>
+    <input id="sens" type="range" min="0" max="100" value="50">
+    <label class="chk"><input id="clip" type="checkbox" checked> Stay inside the property line</label>
+    <div class="row gap"><button id="redo">Re-detect</button></div>
+  </section>
+
+  <section id="editSec" class="hide">
+    <h2>Touch up</h2>
+    <div class="row">
+      <button id="tMove" class="on" title="V">Move</button>
+      <button id="tBrush" title="B">Brush</button>
+      <button id="tPoly" title="P">Outline</button>
+    </div>
+    <div class="row gap">
+      <button id="mAdd" class="on" title="Paint lawn into the active zone (X)">Add</button>
+      <button id="mErase" title="Remove lawn (X)">Erase</button>
+      <button id="mAssign" title="Move existing lawn into the active zone without adding any (X)">Re-zone</button>
+    </div>
+    <label class="sl"><span>Brush size</span><span id="bsz">6 ft</span></label>
+    <input id="brush" type="range" min="1" max="40" value="6">
+    <div class="row gap">
+      <button id="undo" title="Ctrl+Z">Undo</button>
+      <button id="clear">Clear all</button>
+      <button id="show" class="on">Overlay</button>
+    </div>
+    <div class="hint">Brush: drag to paint. Outline: click corners, double-click to finish. Re-zone + Outline: loop around the back yard to make it its own zone.</div>
+  </section>
+
+  <section>
+    <h2>Saved properties</h2>
+    <ul id="saved"></ul>
+    <div class="row gap">
+      <button id="csv">Export CSV</button>
+    </div>
+    <div class="hint">Saved on this computer only. Imagery and parcels: NC OneMap, Wake County, USDA.</div>
+  </section>
+</aside>
+<div id="map"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+'use strict';
+const SVC = 'https://services.nconemap.gov/secure/rest/services';
+const GEOCODE = SVC + '/AddressNC/AddressNC_geocoder/GeocodeServer';
+const PARCELS = SVC + '/NC1Map_Parcels/FeatureServer/1';
+const PARCEL_MAP = SVC + '/NC1Map_Parcels/MapServer';
+const WAKE_PARCELS = 'https://maps.wakegov.com/arcgis/rest/services/Property/Parcels/MapServer/0';   // much faster than the state service, Wake County only
+const ROADS = SVC + '/NC1Map_Transportation/FeatureServer/0';                                        // statewide street centerlines
+// public building-footprint layers (FEMA USA Structures, Microsoft); both are checked because each misses some houses
+const BUILDINGS = ['https://services2.arcgis.com/FiaPA4ga0iQKduv3/arcgis/rest/services/USA_Structures_View/FeatureServer/0',
+  'https://services.arcgis.com/P3ePLMYs2RVChkJx/arcgis/rest/services/MSBFP2/FeatureServer/0'];
+const NOMINATIM ='https://nominatim.openstreetmap.org/search';                                      // backup address search
+const TILES = SVC + '/Imagery/Orthoimagery_Latest_cached/ImageServer/tile/{z}/{y}/{x}';
+const ORTHO = SVC + '/Imagery/Orthoimagery_Latest/ImageServer';
+// infrared sources, tried in order (the newest flights don't have an infrared band published in every county);
+// each returns an image whose channels are [near-infrared, red, green]
+const INFRARED = [[SVC + '/Imagery/Orthoimagery_Latest_CIR/ImageServer', ''], [SVC + '/Imagery/Orthoimagery_2020_2023_4band_analysis/ImageServer', '3,0,1']];
+const SQFT_PER_M2 = 10.7639104;
+const FT = 0.3048;
+const PAD_FT = 25;          // imagery margin around the parcel
+const TARGET_RES_FT = 0.5;  // native imagery resolution
+const MAX_DIM = 2200;       // caps on analysis image size
+const MAX_PX = 1.6e6;
+const ZCOL = [[61, 220, 132], [80, 160, 255], [255, 170, 60], [200, 120, 255], [255, 110, 140], [90, 220, 220], [230, 230, 90], [255, 140, 90]];
+
+const $ = id => document.getElementById(id);
+const enc = encodeURIComponent;
+const fmt = n => Math.round(n).toLocaleString('en-US');
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const CRS = L.CRS.EPSG3857;
+
+// ---------- state ----------
+const S = {
+  parcel: null,   // { attrs, rings:[[[lng,lat]...]], label, pt }
+  G: null,        // grid: { xmin,ymin,xmax,ymax,res,w,h,cos,ppf }
+  rgb: null, cir: null,   // RGBA pixel arrays (cir: R=near-infrared, G=red, B=green)
+  prob: null,     // per-pixel lawn probability from the classifier
+  imperv: null,   // roofs + pavement inside the parcel (for finding the house)
+  front: null,    // { hx, hy, ux, uy }: house centre and unit vector toward the street, in grid pixels
+  inParcel: null, mask: null, undo: [],   // mask: 0 = not lawn, otherwise a zone id
+  zones: [], zone: 1, edited: false,
+  tool: 'move', mode: 'add', show: true, pickArmed: false,
+  poly: [], drawing: false, last: null,
+};
+const defaultZones = () => [{ id: 1, name: 'Front', on: true }, { id: 2, name: 'Back', on: true }];
+const zoneColor = id => ZCOL[(id - 1) % ZCOL.length];
+
+// ---------- map ----------
+const map = L.map('map', { maxZoom: 22, zoomSnap: 0.5 }).setView([35.9, -78.6], 10);
+L.tileLayer(TILES, { maxZoom: 22, maxNativeZoom: 20, attribution: 'Imagery &amp; parcels: NC OneMap' }).addTo(map);
+
+const ExportTiles = L.TileLayer.extend({
+  getTileUrl(c) {
+    const s = this.getTileSize(), nw = c.scaleBy(s), se = nw.add(s);
+    const a = CRS.project(this._map.unproject(nw, c.z)), b = CRS.project(this._map.unproject(se, c.z));
+    return this._url + `/export?bbox=${a.x},${b.y},${b.x},${a.y}&bboxSR=3857&imageSR=3857&size=${s.x},${s.y}&layers=show:1&transparent=true&format=png32&f=image`;
+  }
+});
+const linesLayer = new ExportTiles(PARCEL_MAP, { minZoom: 16, maxZoom: 22, opacity: 0.8 });
+
+const CanvasOverlay = L.ImageOverlay.extend({
+  _initImage() {
+    const el = this._image = this._url;
+    el.classList.add('leaflet-image-layer', 'lm-overlay');
+    if (this._zoomAnimated) el.classList.add('leaflet-zoom-animated');
+  }
+});
+const ovCanvas = document.createElement('canvas');
+let overlay = null, ovCtx = null, ovImg = null;
+const parcelLine = L.polygon([], { color: '#ffd84a', weight: 2, fill: false, interactive: false }).addTo(map);
+const polyLine = L.polyline([], { color: '#fff', weight: 2, dashArray: '4 4', interactive: false }).addTo(map);
+const brushRing = L.circle([0, 0], { radius: 1, color: '#fff', weight: 1, fill: false, interactive: false });
+
+// ---------- helpers ----------
+function status(msg, err) { const s = $('status'); s.textContent = msg || ''; s.classList.toggle('err', !!err); }
+async function getJSON(url, timeoutMs = 30000) {
+  const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { signal: ctl.signal });
+    if (!r.ok) throw new Error('Request failed (' + r.status + ')');
+    const j = await r.json();
+    if (j && j.error) throw new Error(j.error.message || 'Service error');
+    return j;
+  } catch (e) { throw e.name === 'AbortError' ? new Error('The map server took too long to answer.') : e; }
+  finally { clearTimeout(timer); }
+}
+async function fetchPixels(service, bandIds, timeoutMs = 45000, attempts = 2) {
+  const g = S.G;
+  const url = `${service}/exportImage?bbox=${g.xmin},${g.ymin},${g.xmax},${g.ymax}&bboxSR=3857&imageSR=3857&size=${g.w},${g.h}` +
+    `${bandIds ? '&bandIds=' + bandIds : ''}&format=png&f=image`;
+  let blob = null, lastErr = null;
+  for (let attempt = 0; attempt < attempts && !blob; attempt++) {   // the state server is occasionally slow; retry once
+    const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      const r = await fetch(url, { signal: ctl.signal });
+      if (!r.ok) throw new Error('Imagery request failed (' + r.status + ')');
+      blob = await r.blob();
+      if (!/^image\//.test(blob.type)) { blob = null; throw new Error('No imagery here.'); }
+    } catch (e) { lastErr = e.name === 'AbortError' ? new Error('The imagery server timed out.') : e; }
+    finally { clearTimeout(timer); }
+  }
+  if (!blob) throw lastErr;
+  const bmp = await createImageBitmap(blob);
+  const c = document.createElement('canvas'); c.width = g.w; c.height = g.h;
+  const x = c.getContext('2d', { willReadFrequently: true });
+  x.drawImage(bmp, 0, 0, g.w, g.h);
+  return x.getImageData(0, 0, g.w, g.h).data;
+}
+function covered(px) {   // true when the image actually has data (services return transparent pixels where they have none)
+  if (!px) return false;
+  let ok = 0, tot = 0;
+  for (let j = 0; j < px.length; j += 4 * 7) { tot++; if (px[j + 3] > 0 && px[j] + px[j + 1] + px[j + 2] > 0) ok++; }
+  return ok > tot * 0.9;
+}
+async function fetchInfrared() {
+  for (const [svc, bands] of INFRARED) {
+    try { const px = await fetchPixels(svc, bands); if (covered(px)) return px; } catch (e) { /* try the next source */ }
+  }
+  return null;
+}
+const toPx = ll => { const p = CRS.project(ll), g = S.G; return [(p.x - g.xmin) / g.res, (g.ymax - p.y) / g.res]; };
+const pxAreaSqft = () => { const g = S.G; const m = g.res * g.cos; return m * m * SQFT_PER_M2; };
+
+// ---------- search ----------
+let suggTimer = 0, suggItems = [], suggIdx = -1;
+$('q').addEventListener('input', () => {
+  clearTimeout(suggTimer);
+  const text = $('q').value.trim();
+  if (text.length < 4) return hideSugg();
+  suggTimer = setTimeout(async () => {
+    try {
+      const j = await getJSON(`${GEOCODE}/suggest?text=${enc(text)}&maxSuggestions=6&f=json`, 8000);
+      if ($('q').value.trim() !== text) return;
+      suggItems = j.suggestions || []; suggIdx = -1;
+      const ul = $('sugg'); ul.innerHTML = '';
+      suggItems.forEach((s, i) => { const li = document.createElement('li'); li.textContent = s.text; li.onmousedown = e => { e.preventDefault(); chooseSugg(i); }; ul.appendChild(li); });
+      ul.classList.toggle('hide', !suggItems.length);
+    } catch (e) { hideSugg(); }
+  }, 220);
+});
+$('q').addEventListener('keydown', e => {
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    if (!suggItems.length) return;
+    e.preventDefault();
+    suggIdx = (suggIdx + (e.key === 'ArrowDown' ? 1 : -1) + suggItems.length) % suggItems.length;
+    [...$('sugg').children].forEach((li, i) => li.classList.toggle('on', i === suggIdx));
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    if (suggIdx >= 0) chooseSugg(suggIdx); else { hideSugg(); search($('q').value.trim()); }
+  } else if (e.key === 'Escape') hideSugg();
+});
+$('q').addEventListener('blur', () => setTimeout(hideSugg, 150));
+function hideSugg() { $('sugg').classList.add('hide'); suggItems = []; suggIdx = -1; }
+function chooseSugg(i) { const s = suggItems[i]; $('q').value = s.text; hideSugg(); search(s.text, s.magicKey); }
+
+async function geocode(text, magicKey) {
+  try {   // state address points first (rooftop-accurate) ...
+    const j = await getJSON(`${GEOCODE}/findAddressCandidates?SingleLine=${enc(text)}${magicKey ? '&magicKey=' + enc(magicKey) : ''}&outSR=4326&maxLocations=1&f=json`, 10000);
+    const c = (j.candidates || [])[0];
+    if (c) return { ll: L.latLng(c.location.y, c.location.x), label: c.address };
+  } catch (e) { /* fall through to the backup */ }
+  try {   // ... then OpenStreetMap as a backup when the state geocoder is slow or has no match
+    const j = await getJSON(`${NOMINATIM}?q=${enc(/\bNC\b|north carolina/i.test(text) ? text : text + ', NC')}&format=jsonv2&limit=1&countrycodes=us`, 10000);
+    if (j && j[0]) return { ll: L.latLng(+j[0].lat, +j[0].lon), label: text.toUpperCase() };
+  } catch (e) { /* no match */ }
+  return null;
+}
+async function search(text, magicKey) {
+  if (!text) return;
+  status('Finding address…');
+  try {
+    const hit = await geocode(text, magicKey);
+    if (!hit) return status('Address not found. Try "123 Main St, City" or pick the property on the map.', true);
+    await loadParcelAt(hit.ll, hit.label);
+  } catch (e) { status(e.message, true); }
+}
+
+// ---------- parcel ----------
+function findParcel(ll) {   // ask the fast county service and the statewide one at once; first real answer wins
+  const pt = `geometry=${ll.lng},${ll.lat}&geometryType=esriGeometryPoint&inSR=4326&spatialRel=esriSpatialRelIntersects&outSR=4326&returnGeometry=true&f=json`;
+  const first = j => { const f = (j.features || []).filter(f => f.geometry && f.geometry.rings && f.geometry.rings.length)[0]; if (!f) throw new Error('none'); return f; };
+  const wake = getJSON(`${WAKE_PARCELS}/query?${pt}&outFields=PIN_NUM,SITE_ADDRESS,CITY_DECODE`, 15000).then(first)
+    .then(f => ({ attrs: { parno: f.attributes.PIN_NUM, siteadd: f.attributes.SITE_ADDRESS, scity: f.attributes.CITY_DECODE, cntyname: 'Wake' }, rings: f.geometry.rings }));
+  const state = getJSON(`${PARCELS}/query?${pt}&outFields=parno,siteadd,scity,cntyname,gisacres`, 45000).then(first)
+    .then(f => ({ attrs: f.attributes, rings: f.geometry.rings }));
+  return Promise.any([wake, state]).catch(() => null);
+}
+async function loadParcelAt(ll, label) {
+  status('Finding property line…');
+  map.setView(ll, Math.max(map.getZoom(), 19));
+  const p = await findParcel(ll);
+  if (!p) { armPick(true); return status('No property found at that spot. Click the property on the map.', true); }
+  const a = p.attrs;
+  const site = [a.siteadd, a.scity].filter(v => v && String(v).trim()).join(', ');
+  await openParcel({ attrs: a, rings: p.rings, label: label || site || ('Parcel ' + a.parno), pt: [ll.lat, ll.lng] });
+}
+
+async function openParcel(parcel, saved) {
+  S.parcel = parcel; S.undo = []; S.poly = []; polyLine.setLatLngs([]);
+  S.prob = S.imperv = S.front = S.bld = S.dark = S.shadeVeg = null; S.edited = false;
+  S.zones = saved && saved.zones ? saved.zones.map(z => ({ id: z.id, name: z.name, on: z.on !== false })) : defaultZones();
+  S.zone = S.zones[0].id;
+  const latlngs = parcel.rings.map(r => r.map(p => L.latLng(p[1], p[0])));
+  parcelLine.setLatLngs(latlngs);
+  const b = parcelLine.getBounds();
+  map.fitBounds(b.pad(0.25), { maxZoom: 21 });
+
+  // analysis grid in web-mercator, padded
+  // (latitude is rounded and the grid snapped to a lattice so the same property always gets the same grid)
+  const cos = Math.cos(Math.round(b.getCenter().lat * 100) / 100 * Math.PI / 180);
+  const sw = CRS.project(b.getSouthWest()), ne = CRS.project(b.getNorthEast());
+  const pad = PAD_FT * FT / cos;
+  let res = TARGET_RES_FT * FT / cos;
+  const spanX = ne.x - sw.x + 2 * pad, spanY = ne.y - sw.y + 2 * pad;
+  const coarsen = Math.max(1, Math.max(spanX, spanY) / res / MAX_DIM, Math.sqrt(spanX * spanY / (res * res) / MAX_PX));
+  res *= Math.ceil(coarsen * 4) / 4;   // big parcels: step resolution down in quarter steps
+  const q = res * 16;
+  const xmin = Math.floor((sw.x - pad) / q) * q, ymax = Math.ceil((ne.y + pad) / q) * q;
+  const w = Math.ceil((ne.x + pad - xmin) / q) * 16, h = Math.ceil((ymax - (sw.y - pad)) / q) * 16;
+  S.G = { xmin, ymax, xmax: xmin + w * res, ymin: ymax - h * res, res, w, h, cos, ppf: FT / (res * cos) };
+
+  // parcel mask
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const x = c.getContext('2d');
+  x.beginPath();
+  latlngs.forEach(ring => { ring.forEach((ll, i) => { const p = toPx(ll); i ? x.lineTo(p[0], p[1]) : x.moveTo(p[0], p[1]); }); x.closePath(); });
+  x.fill('evenodd');
+  const pd = x.getImageData(0, 0, w, h).data;
+  S.inParcel = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) S.inParcel[i] = pd[i * 4 + 3] > 127 ? 1 : 0;
+  S.mask = new Uint8Array(w * h);
+
+  // overlay
+  ovCanvas.width = w; ovCanvas.height = h;
+  ovCtx = ovCanvas.getContext('2d'); ovImg = ovCtx.createImageData(w, h);
+  const ob = L.latLngBounds(CRS.unproject(L.point(S.G.xmin, S.G.ymin)), CRS.unproject(L.point(S.G.xmax, S.G.ymax)));
+  if (overlay) overlay.remove();
+  overlay = new CanvasOverlay(ovCanvas, ob, { opacity: 1, interactive: false }).addTo(map);
+  parcelLine.bringToFront();
+
+  $('addr').textContent = parcel.label;
+  const a = parcel.attrs || {};
+  $('meta').textContent = [a.cntyname ? a.cntyname + ' County' : '', a.parno ? 'Parcel ' + a.parno : ''].filter(Boolean).join(' · ');
+  ['propSec', 'zoneSec', 'detSec', 'editSec'].forEach(id => $(id).classList.remove('hide'));
+  buildZones(); render();
+
+  status('Loading aerial imagery…');
+  S.rgb = S.cir = null;
+  const g = S.G, m = 60 / cos, toGrid = p => [(p[0] - g.xmin) / g.res, (g.ymax - p[1]) / g.res];
+  const env = d => `geometry=${g.xmin - d},${g.ymin - d},${g.xmax + d},${g.ymax + d}&geometryType=esriGeometryEnvelope&inSR=3857&spatialRel=esriSpatialRelIntersects&outSR=3857&returnGeometry=true&f=json`;
+  // street centerlines within ~60 m, used to tell the front yard from the back
+  const roadsP = getJSON(`${ROADS}/query?${env(m)}&outFields=OBJECTID`, 40000)
+    .then(j => (j.features || []).flatMap(f => (f.geometry && f.geometry.paths) || []).map(path => path.map(toGrid)))
+    .catch(() => null);
+  // building footprints, cut out of the lawn and used to locate the house
+  const bldP = Promise.all(BUILDINGS.map(u => getJSON(`${u}/query?${env(0)}&outFields=OBJECTID`, 12000)
+    .then(j => (j.features || []).flatMap(f => (f.geometry && f.geometry.rings) || [])).catch(() => [])))
+    .then(lists => {
+      const rings = lists.flat(); if (!rings.length) return null;
+      const c = document.createElement('canvas'); c.width = g.w; c.height = g.h; const x = c.getContext('2d');
+      for (const ring of rings) { x.beginPath(); ring.forEach((p, i) => { const q = toGrid(p); i ? x.lineTo(q[0], q[1]) : x.moveTo(q[0], q[1]); }); x.closePath(); x.fill(); }
+      const d = x.getImageData(0, 0, g.w, g.h).data, out = new Uint8Array(g.w * g.h);
+      for (let i = 0; i < out.length; i++) out[i] = d[i * 4 + 3] > 127 ? 1 : 0;
+      return out;
+    });
+  const LATE = {}, soon = p => Promise.race([p, sleep(2500).then(() => LATE)]);
+  try {
+    // the colour photo does the detecting; the infrared version is only used to see into shadows, so don't wait long for it
+    const cirP = fetchInfrared().catch(() => null);
+    const rgb = await fetchPixels(ORTHO, '');
+    const cir = await Promise.race([cirP, sleep(12000).then(() => null)]);
+    if (S.parcel !== parcel) return;
+    if (!covered(rgb)) throw new Error('no aerial imagery covers this spot.');
+    S.rgb = rgb; S.cir = cir;
+    status('Finding the lawn…'); await sleep(0);
+    classify();
+    const [roads, bld] = await Promise.all([soon(roadsP), soon(bldP)]);
+    if (S.parcel !== parcel) return;
+    const apply = (r, b) => { if (b !== LATE) S.bld = b; if (r !== LATE && r) S.front = findFront(r); buildZones(); };
+    apply(roads, bld);
+    if (saved) status('Loaded saved measurement.');
+    else {
+      detect(); S.edited = false;
+      status(S.cir ? 'Lawn detected. Touch up with the brush if needed.' : 'Lawn detected (no infrared image here, so shaded lawn may be missed).', !S.cir);
+    }
+    if (roads === LATE || bld === LATE) Promise.all([roadsP, bldP]).then(([r, b]) => {   // street / building data arrived late
+      if (S.parcel !== parcel) return;
+      apply(r, b);
+      if (!saved && !S.edited) { S.undo.pop(); detect(); S.edited = false; }   // redo the detection unless the user has started editing
+    });
+  } catch (e) {
+    status('Could not load imagery: ' + e.message + ' You can still outline the lawn by hand.', true);
+  }
+}
+
+// ---------- image filters ----------
+function integral(src, w, h, sq) {
+  const W = w + 1, I = new Float64Array(W * (h + 1));
+  for (let y = 0; y < h; y++) { let s = 0;
+    for (let x = 0; x < w; x++) { const v = src[y * w + x]; s += sq ? v * v : v; I[(y + 1) * W + x + 1] = I[y * W + x + 1] + s; } }
+  return I;
+}
+function boxFromI(I, w, h, r) {
+  const W = w + 1, out = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) { const y0 = Math.max(0, y - r), y1 = Math.min(h, y + r + 1);
+    for (let x = 0; x < w; x++) { const x0 = Math.max(0, x - r), x1 = Math.min(w, x + r + 1);
+      out[y * w + x] = (I[y1 * W + x1] - I[y0 * W + x1] - I[y1 * W + x0] + I[y0 * W + x0]) / ((y1 - y0) * (x1 - x0)); } }
+  return out;
+}
+const boxMean = (src, w, h, r) => boxFromI(integral(src, w, h), w, h, r);
+function boxStd(src, w, h, r) {
+  const m = boxMean(src, w, h, r), m2 = boxFromI(integral(src, w, h, true), w, h, r);
+  for (let i = 0; i < m.length; i++) m2[i] = Math.sqrt(Math.max(0, m2[i] - m[i] * m[i]));
+  return m2;
+}
+function boxMin(src, w, h, r) {
+  const tmp = new Float32Array(w * h), out = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let m = Infinity; const a = Math.max(0, x - r), b = Math.min(w - 1, x + r);
+    for (let i = a; i <= b; i++) { const v = src[y * w + i]; if (v < m) m = v; }
+    tmp[y * w + x] = m;
+  }
+  for (let y = 0; y < h; y++) { const a = Math.max(0, y - r), b = Math.min(h - 1, y + r);
+    for (let x = 0; x < w; x++) { let m = Infinity; for (let i = a; i <= b; i++) { const v = tmp[i * w + x]; if (v < m) m = v; } out[y * w + x] = m; } }
+  return out;
+}
+function morph(mask, w, h, r, dilate) {   // binary dilate / erode with a (2r+1) square
+  const tmp = new Uint8Array(w * h), out = new Uint8Array(w * h), hit = dilate ? 1 : 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let v = 1 - hit; const a = Math.max(0, x - r), b = Math.min(w - 1, x + r);
+    for (let i = a; i <= b; i++) if (mask[y * w + i] === hit) { v = hit; break; }
+    tmp[y * w + x] = v;
+  }
+  for (let y = 0; y < h; y++) { const a = Math.max(0, y - r), b = Math.min(h - 1, y + r);
+    for (let x = 0; x < w; x++) { let v = 1 - hit; for (let i = a; i <= b; i++) if (tmp[i * w + x] === hit) { v = hit; break; } out[y * w + x] = v; } }
+  return out;
+}
+// walk 4-connected blobs of `val`; fn(pixels, count, touchesBorder) is called for each
+function blobs(mask, w, h, val, fn) {
+  const seen = new Uint8Array(w * h), stack = new Int32Array(w * h);
+  for (let s = 0; s < w * h; s++) {
+    if (seen[s] || mask[s] !== val) continue;
+    let top = 0, border = false; const members = [];
+    stack[top++] = s; seen[s] = 1;
+    while (top) {
+      const i = stack[--top]; members.push(i);
+      const x = i % w, y = (i - x) / w;
+      if (x === 0 || y === 0 || x === w - 1 || y === h - 1) border = true;
+      if (x > 0 && !seen[i - 1] && mask[i - 1] === val) { seen[i - 1] = 1; stack[top++] = i - 1; }
+      if (x < w - 1 && !seen[i + 1] && mask[i + 1] === val) { seen[i + 1] = 1; stack[top++] = i + 1; }
+      if (y > 0 && !seen[i - w] && mask[i - w] === val) { seen[i - w] = 1; stack[top++] = i - w; }
+      if (y < h - 1 && !seen[i + w] && mask[i + w] === val) { seen[i + w] = 1; stack[top++] = i + w; }
+    }
+    fn(members, members.length, border);
+  }
+}
+
+// ---------- lawn classifier ----------
+// Per-pixel colour and texture features from the state's 6-inch aerial photo. A small neural net, fitted to
+// hand-labelled lots around Wake, Franklin and Granville counties, turns them into a lawn probability.
+// Order here must match MODEL.
+const FEATS = ['bright', 'tan', 'exg', 'sat', 'rn', 'gn', 'bright3', 'bright8', 'tan3', 'exg3', 'rough1', 'roughB3', 'coarseB'];
+/*MODEL_BEGIN*/
+const MODEL = {"mean":[0.5002,0.042,0.0353,0.1714,0.329,0.3399,0.499,0.4944,0.0412,0.035,0.0225,0.0296,0.0341],"std":[0.1841,0.2145,0.0473,0.1022,0.0406,0.0156,0.166,0.1505,0.2046,0.043,0.0174,0.0216,0.0233],"layers":[{"w":[-0.069,0.221,-0.138,-0.153,0.519,0.04,0.659,0.445,-0.461,0.022,0.404,-0.505,-1.655,0.785,-0.62,-0.258,-0.476,-0.778,0.023,0.339,1.042,-0.739,-0.019,0.292,-0.204,1.348,-0.147,0.057,0.427,0.219,-0.149,-0.223,-0.32,-0.848,0.306,0.029,0.337,1.739,-0.514,0.078,-0.051,0.452,0.027,-0.128,0.184,0.264,0.908,0.735,1.166,-0.057,1.272,-0.641,0.261,0.656,0.075,1.034,0.53,-0.139,0.021,0.456,-0.094,-0.27,0.295,0.601,-0.216,-0.424,0.018,0.354,0.613,0.156,0.127,0.712,0.491,0.215,1.134,0.13,0.054,0.477,0.725,-0.375,-0.02,0.31,0.003,0.125,0.115,0.712,-1.575,0.597,0.294,0.479,-0.795,-0.158,0.12,0.127,-0.437,-0.098,-0.103,-0.269,-1.134,1.638,0.584,-0.176,0.569,-0.735,-1.129,0.01,0.341,0.163,0.472,-0.292,-0.609,1.385,-0.502,0.063,-0.138,0.175,-0.116,0.34,-0.041,-0.36,0.544,0.025,0.066,-0.259,-0.113,-0.384,-1.145,0.273,-0.606,0.494,-0.21,0.243,-0.365,-0.368,-0.083,0.387,0.31,1.449,-1.16,0.407,0.043,-0.074,0.304,0.722,-0.475,-0.278,-0.289,0.115,-0.271,0.327,0.422,1.168,0.528,0.109,0.189,-0.652,0.117,-0.293,0.071,0.11,-0.262,-0.184,1.071,-0.528,-0.793,-0.365,0.044,0.799,0.215,0.171,-0.737,-0.071,-1.091,-0.159,0.221,0.731,-0.934,0.157,-0.673,-0.036,-0.43,-0.1,-0.264,0.557,-0.235,-0.062,-0.347,0.213,-1.537,-1.72,0.798,0.223,0.252,0.034,-0.067,0.526,-0.074,0.117,0.612,0.504,-0.077,-0.015,0.33,-0.239,-1.614,-0.061,0.518,1.074,-0.003,0.494,-0.034,-0.045,0.151,0.31,-0.931,0.718,-0.669,0.01,0.247,-1.566,-0.079,0.831,0.933,-0.001,-0.079,0.515,0.308,0.234,-1.215,-0.61,-0.086,-0.007,-0.701,0.436,0.068,0.07,0.299,0.037,0.077,-0.19,-0.469,-1.521,0.325,-0.634,-0.052,-0.328,0.023,-0.283,-0.018,0.075,-0.028,0.118,-0.055,0.142,-0.42,0.551,-1.494,0.127,0.481,-0.861,-0.157,-0.259,0.161,-0.439,-0.317,0.045,0.717,0.463,0.983,0.165,-1.171,0.158,-0.248,0.012,0.17,-0.252,0.715,0.121,-0.012,0.283,-0.574,1.233,-1.375,0.12,-1.017,-0.065,-0.632,-0.494,0.081,-1.084,-0.618,0.071,1.166,-0.198,0.009,-0.026,-0.726,-1.377,0.723,-0.412,0.364,0.26,-0.594,0.324,-0.185,-0.343,-0.117,-0.094,-0.75,0.458,0.632,0.527],"b":[0.234,-1.32,-0.12,-1,-0.308,0.461,0.252,-0.568,-0.019,-0.528,0.799,0.336,-0.208,0.339,-0.863,-0.547,0.69,-0.68,-1.457,0.002,0.056,-0.603,-0.09,0.481]},{"w":[-0.132,-1.495,0.12,-0.155,-0.11,-0.381,0.951,-1.882,0.225,0.121,0.676,-0.737,0.612,0.114,-0.265,0.148,0.244,0.794,0.278,0.052,0.348,0.344,0.053,-0.378,-1.113,-0.706,0.256,0.214,-0.647,-0.379,0.004,0.168,-0.353,-0.322,0.624,-0.438,0.127,0.849,0.56,-1.177,-0.407,-0.21,0.447,-0.625,-0.176,0.357,0.055,-0.152,-0.363,-0.779,0.342,-0.156,0.153,-0.256,0.996,0.268,0.047,-0.229,-0.938,-0.159,0.147,-0.09,0.228,0.006,0.784,0.423,-0.185,-0.373,1.02,0.155,-1.565,-0.296,0.433,-0.108,-0.611,-0.418,0.502,-0.79,0.103,0.406,-0.14,0.047,0.419,-0.023,0.239,0.601,-1.415,-0.128,0.644,0.439,-0.262,-0.345,0.078,-0.798,0.354,0.203,0.323,-1.271,-1.227,-1.858,0.236,-1.522,0.426,0.747,-0.372,0.448,0.346,-0.427,-0.223,0.489,-1.342,0.033,0.648,-0.35,-0.223,-0.373,-0.12,0.095,0.698,-0.903,-0.613,0.575,-0.181,-0.751,-0.922,0.5,-0.019,-0.125,-0.354,-0.226,0.712,-0.261,0.689,0.276,-0.303,-0.296,0.111,-0.646,0.329,-0.117,-0.031,-1.398,-0.15,-0.454,0.651,-0.023,-0.444,0.3,-0.576,-0.101,-0.196,-0.505,-1.091,-0.725,-0.007,0.261,0.201,0.138,0.854,0.011,0.047,0.353,-0.892,-0.689,0.918,0.19,-0.632,0.551,0.234,-0.087,-0.754,0.221,-0.795,-0.086,0.481,0.775,-0.109,0.45,0.334,-0.19,0.23,-0.488,-0.435,-0.655,0.897,-0.067,0.514,-0.994,-0.173,0.589,0.406,-0.721,-0.194,-0.372,0.056,0.781,0.114,-0.046,-0.518,-0.066,0.238,-0.654,-0.317,0.404,-0.201,0.258,0.333,-1.427,-0.003,-0.079,-0.828,0.131,-0.116,0.321,1.296,-0.487,0.26,0.384,-0.407,0.16,-0.626,0.384,0.817,-0.003,-0.324,-0.596,0.338,-0.781,0.195,0.543,-0.557,0.635,0.242,-0.742,-0.552,0.414,0.059,-0.015,-0.049,0.318,-1.183,0.406,0.528,0.42,0.203,0.003,-0.274,0.496,-0.865,-0.173,-0.502,0.13,-0.124,0.539,0.724,-0.604,-0.186,-0.776,0.581,0.486,-0.794,1.32,0.087,-0.595,-0.108,0.759,-0.98,-0.602,0.214,0.417,-0.633,-0.387,-0.12,-1.036,0.106,0.482,-0.602,-0.123,0.269,-0.484,0.329,0.852,-0.769,0.271,-0.138,-0.039,0.252,0.615],"b":[0.097,0.29,0.472,1.154,-0.149,0.903,-0.173,-0.581,0.819,0.575,-0.615,0.613]},{"w":[-1.343,-0.825,1.027,-0.82,-2.524,-1.015,0.955,1.193,0.926,-0.704,-1.329,0.904],"b":[0.418]}]};
+/*MODEL_END*/
+
+// Infrared brightness is not calibrated the same from one flight to the next (it differs county to county), so
+// rescale it until grey man-made surfaces - roads, roofs, concrete - come out neutral. Returns the multiplier.
+function nirGain(px, gray, n) {
+  const q = [], all = [];
+  for (let i = 0; i < n; i += 3) { const N = px[i * 4], R = px[i * 4 + 1]; if (R < 12) continue; const v = N / R; all.push(v); if (gray[i]) q.push(v); }
+  const pick = (a, p) => { a.sort((x, y) => x - y); return a[Math.floor(p * (a.length - 1))]; };
+  const ratio = q.length >= 300 ? pick(q, 0.3) : all.length ? pick(all, 0.08) : 1;   // few grey pixels: use the least-vegetated ones
+  return Math.max(0.5, Math.min(2.5, 1 / (ratio || 1)));
+}
+function computeFeatures() {
+  const { w, h, ppf } = S.G, n = w * h, rgb = S.rgb, cir = S.cir;
+  const r1 = Math.max(1, Math.round(1.5 * ppf)), r3 = Math.max(2, Math.round(3 * ppf)), r8 = Math.max(4, Math.round(8 * ppf));
+  const mk = () => new Float32Array(n);
+  const bright = mk(), tan = mk(), exg = mk(), sat = mk(), rn = mk(), gn = mk(), gray = new Uint8Array(n);
+  for (let i = 0, j = 0; i < n; i++, j += 4) {
+    const r = rgb[j] / 255, g = rgb[j + 1] / 255, b = rgb[j + 2] / 255, sum = r + g + b, br = sum / 3;
+    bright[i] = br;
+    tan[i] = Math.max(-1.5, Math.min(1.5, (r - b) / (br + 0.02)));
+    exg[i] = (2 * g - r - b) / (sum + 0.02);
+    sat[i] = (Math.max(r, g, b) - Math.min(r, g, b)) / (Math.max(r, g, b) + 0.02);
+    rn[i] = r / (sum + 0.02); gn[i] = g / (sum + 0.02);
+    gray[i] = Math.abs(tan[i]) < 0.08 && Math.abs(exg[i]) < 0.03 && br > 0.35 && br < 0.92 ? 1 : 0;
+  }
+  const tex = (src, rA, rB) => boxMin(boxStd(src, w, h, rA), w, h, rB);   // local roughness; the min keeps lawn edges from reading as rough
+  const X = [bright, tan, exg, sat, rn, gn, boxMean(bright, w, h, r3), boxMean(bright, w, h, r8), boxMean(tan, w, h, r3), boxMean(exg, w, h, r3),
+    tex(bright, r1, r1), tex(bright, r3, r3), tex(boxMean(bright, w, h, r1), r8, r8)];
+  // infrared (when the county has it): smoothed greenness and infrared brightness, used only for shadows and for finding the house
+  let nd3 = null, nir3 = null;
+  if (cir) {
+    const k = nirGain(cir, gray, n), nir = mk(), ndvi = mk();
+    for (let i = 0, j = 0; i < n; i++, j += 4) { const N = Math.min(1.6, k * cir[j] / 255), R = cir[j + 1] / 255; nir[i] = N; ndvi[i] = (N - R) / (N + R + 1e-6); }
+    nd3 = boxMean(ndvi, w, h, r3); nir3 = boxMean(nir, w, h, r3);
+  }
+  return { X, nd3, nir3 };
+}
+function predict(X, n, model) {
+  const D = model.mean.length, out = new Float32Array(n), cols = model.cols || [...Array(D).keys()];
+  let a = new Float32Array(64), z = new Float32Array(64);
+  const Ls = model.layers.map(l => ({ w: Float32Array.from(l.w), b: Float32Array.from(l.b), nin: l.w.length / l.b.length, nout: l.b.length }));
+  for (let i = 0; i < n; i++) {
+    for (let d = 0; d < D; d++) a[d] = (X[cols[d]][i] - model.mean[d]) / model.std[d];
+    for (let l = 0; l < Ls.length; l++) {
+      const { w, b, nin, nout } = Ls[l], last = l === Ls.length - 1;
+      for (let o = 0; o < nout; o++) { let s = b[o]; const off = o * nin; for (let k = 0; k < nin; k++) s += w[off + k] * a[k]; z[o] = last || s > 0 ? s : 0; }
+      const t = a; a = z; z = t;
+    }
+    out[i] = 1 / (1 + Math.exp(-a[0]));
+  }
+  return out;
+}
+function classify() {
+  const { w, h, ppf } = S.G, n = w * h;
+  const { X, nd3: nd, nir3 } = computeFeatures();
+  if (LM.keep) { S.X = X; S.nd3 = nd; S.nir3 = nir3; }
+  // Colour-only model: in testing on unseen lots it did as well as models that also used infrared and a summer
+  // image, it needs one download instead of three, and it always matches the newest photo.
+  const model = MODEL;
+  let prob;
+  if (LM.model || model) prob = predict(X, n, LM.model || model);
+  else { prob = new Float32Array(n); for (let i = 0; i < n; i++) prob[i] = Math.max(0, Math.min(1, (X[9][i] - 0.02) / 0.06)); }   // untrained fallback: greenness only
+  S.prob = boxMean(prob, w, h, Math.max(1, Math.round(1 * ppf)));
+  // Shadows: colour cannot see into them, but infrared can. "dark" marks shadow-dark pixels; "shadeVeg" marks dark
+  // pixels that are genuinely in shadow (dark in infrared too, unlike evergreen canopy) yet still read as vegetation.
+  const dark = new Uint8Array(n), shadeVeg = new Uint8Array(n), imp = new Uint8Array(n), b3 = X[6];
+  for (let i = 0; i < n; i++) {
+    dark[i] = b3[i] < 0.3 ? 1 : 0;
+    if (nd) shadeVeg[i] = b3[i] < 0.27 && nir3[i] < 0.45 && nd[i] > 0.2 ? 1 : 0;
+    // roofs and pavement inside the parcel (for finding the house): not vegetation, or with no infrared simply grey
+    imp[i] = S.inParcel[i] && S.prob[i] < 0.3 && (nd ? nd[i] < 0.08 : X[3][i] < 0.1) ? 1 : 0;
+  }
+  S.dark = dark; S.shadeVeg = nd ? shadeVeg : null; S.imperv = imp;
+}
+
+// Where is the house, and which way is the street? Returns { hx, hy, ux, uy } in grid pixels, or null.
+function findFront(roads) {
+  if (!roads || !roads.length || !S.imperv) return null;
+  const { w, h, ppf } = S.G;
+  let best = null; const biggest = (px, cnt) => { if (!best || cnt > best.length) best = px; };
+  if (S.bld) {   // the house is the biggest mapped building on the lot ...
+    const inLot = new Uint8Array(w * h); for (let i = 0; i < inLot.length; i++) inLot[i] = S.bld[i] && S.inParcel[i] ? 1 : 0;
+    blobs(inLot, w, h, 1, biggest);
+    if (best && best.length * pxAreaSqft() < 300) best = null;
+  }
+  // ... or, when no footprint is mapped, the biggest solid roof/pavement blob once narrow strips (walks, driveways) are eroded away
+  if (!best) blobs(morph(S.imperv, w, h, Math.max(2, Math.round(5 * ppf)), false), w, h, 1, biggest);
+  let hx, hy;
+  if (best && best.length * pxAreaSqft() > 100) { hx = hy = 0; for (const i of best) { hx += i % w; hy += (i - i % w) / w; } hx /= best.length; hy /= best.length; }
+  else if (S.parcel.pt) { [hx, hy] = toPx(L.latLng(S.parcel.pt[0], S.parcel.pt[1])); }
+  else return null;
+  let bd = Infinity, qx = 0, qy = 0;   // nearest point on any street centerline
+  for (const path of roads) for (let k = 0; k + 1 < path.length; k++) {
+    const [ax, ay] = path[k], [bx, by] = path[k + 1], dx = bx - ax, dy = by - ay, L2 = dx * dx + dy * dy;
+    const t = L2 ? Math.max(0, Math.min(1, ((hx - ax) * dx + (hy - ay) * dy) / L2)) : 0;
+    const px = ax + t * dx, py = ay + t * dy, d = Math.hypot(px - hx, py - hy);
+    if (d < bd) { bd = d; qx = px; qy = py; }
+  }
+  if (!isFinite(bd) || bd < 1) return null;
+  return { hx, hy, ux: (qx - hx) / bd, uy: (qy - hy) / bd };
+}
+// label lawn pixels Front (street side of the house centre) or Back; without street data everything is one zone
+function splitZones(m) {
+  const { w, h } = S.G, f = S.front, zf = S.zones[0].id, zb = (S.zones[1] || S.zones[0]).id;
+  for (let y = 0, i = 0; y < h; y++) for (let x = 0; x < w; x++, i++) {
+    if (!m[i]) continue;
+    m[i] = !f || (x - f.hx) * f.ux + (y - f.hy) * f.uy >= 0 ? zf : zb;
+  }
+}
+function detect() {
+  if (!S.prob) return;
+  pushUndo();
+  const { w, h, ppf } = S.G, n = w * h, clip = $('clip').checked;
+  const thr = 0.78 - 0.56 * (+$('sens').value / 100);   // slider midpoint = 50% probability
+  let m = new Uint8Array(n);
+  const bld = S.bld, ok = i => (!clip || S.inParcel[i]) && !(bld && bld[i]);   // never lawn: outside the lot (if clipping), or on a mapped building
+  for (let i = 0; i < n; i++) m[i] = S.prob[i] > thr && ok(i) ? 1 : 0;
+  const px = pxAreaSqft(), r = Math.max(1, Math.round(1 * ppf));
+  // bridge thin shadows (bare branches, fences) that cut across a lawn: close gaps up to ~8 ft wide, but only through dark pixels
+  const rb = Math.max(2, Math.round(4 * ppf)), closed = morph(morph(m, w, h, rb, true), w, h, rb, false);
+  for (let i = 0; i < n; i++) if (!m[i] && closed[i] && S.dark[i] && ok(i)) m[i] = 1;
+  // grow lawn into adjoining shadow that infrared says is vegetation (house and tree shadows), up to ~30 ft
+  if (S.shadeVeg) {
+    let front = []; const sv = S.shadeVeg;
+    for (let i = 0; i < n; i++) if (m[i]) front.push(i);
+    for (let step = 0, max = Math.round(30 * ppf); step < max && front.length; step++) {
+      const next = [];
+      for (const i of front) { const x = i % w;
+        for (const j of [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, i - w, i + w]) if (j >= 0 && j < n && !m[j] && sv[j] && ok(j)) { m[j] = 1; next.push(j); } }
+      front = next;
+    }
+  }
+  m = morph(morph(m, w, h, r, true), w, h, r, false);    // close small gaps
+  m = morph(morph(m, w, h, r, false), w, h, r, true);    // open: drop slivers
+  blobs(m, w, h, 1, (p, cnt) => { if (cnt * px < 60) for (const i of p) m[i] = 0; });               // remove specks under ~60 sq ft
+  blobs(m, w, h, 0, (p, cnt, border) => { if (!border && cnt * px < 100) for (const i of p) m[i] = 1; });  // fill holes under ~100 sq ft (tree trunks, shadows)
+  for (let i = 0; i < n; i++) if (m[i] && !ok(i)) m[i] = 0;
+  splitZones(m);
+  S.mask = m;
+  render();
+}
+
+// ---------- zones ----------
+function buildZones() {
+  const box = $('zones'); box.innerHTML = '';
+  S.zones.forEach(z => {
+    const c = zoneColor(z.id), row = document.createElement('div');
+    row.className = 'zone' + (z.id === S.zone ? ' active' : '') + (z.on ? '' : ' off'); row.dataset.id = z.id;
+    const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = z.on; cb.title = 'Include in total';
+    cb.onclick = e => { e.stopPropagation(); z.on = cb.checked; buildZones(); render(); };
+    const sw = document.createElement('span'); sw.className = 'sw'; sw.style.background = `rgb(${c})`;
+    const nm = document.createElement('span'); nm.className = 'zn'; nm.textContent = z.name;
+    nm.ondblclick = e => { e.stopPropagation(); const v = prompt('Zone name', z.name); if (v && v.trim()) { z.name = v.trim().slice(0, 24); buildZones(); render(); } };
+    const ar = document.createElement('span'); ar.className = 'za'; ar.id = 'za' + z.id; if (z.sqft != null) ar.textContent = fmt(z.sqft) + ' sq ft';
+    row.append(cb, sw, nm, ar);
+    row.onclick = () => { S.zone = z.id; buildZones(); setMode(S.mode); };
+    box.appendChild(row);
+  });
+  $('zSplit').disabled = !S.front;
+}
+$('zAdd').onclick = () => {
+  const names = ['Side', 'Front 2', 'Back 2', 'Other'], used = new Set(S.zones.map(z => z.name));
+  const v = prompt('Name for the new zone', names.find(nm => !used.has(nm)) || 'Zone ' + (S.zones.length + 1));
+  if (!v || !v.trim()) return;
+  const id = Math.max(...S.zones.map(z => z.id)) + 1;
+  if (id > 12) return status('That is the most zones one property can have.', true);
+  S.zones.push({ id, name: v.trim().slice(0, 24), on: true }); S.zone = id;
+  buildZones(); setMode('assign'); render();
+  status('New zone ready. Use Brush or Outline to move lawn into it.');
+};
+$('zSplit').onclick = () => { if (!S.front || !S.mask) return; pushUndo(); splitZones(S.mask); S.edited = true; render(); };
+
+// ---------- render + stats ----------
+let rafPending = false;
+function render() {   // redraw on the next frame (with a timer as backup, since browsers pause frames in background tabs)
+  if (rafPending) return; rafPending = true;
+  const go = () => { if (!rafPending) return; rafPending = false; draw(); };
+  requestAnimationFrame(go); setTimeout(go, 80);
+}
+function draw() {
+  const g = S.G; if (!g) return;
+  const { w, h } = g, m = S.mask, d = ovImg.data, cnt = new Float64Array(16);
+  const on = new Uint8Array(16), col = []; S.zones.forEach(z => { on[z.id] = z.on ? 1 : 0; col[z.id] = zoneColor(z.id); });
+  let lot = 0;
+  for (let i = 0, j = 0; i < w * h; i++, j += 4) {
+    if (S.inParcel[i]) lot++;
+    const v = m[i];
+    if (v) {
+      cnt[v]++;
+      const x = i % w, c = col[v] || ZCOL[0];
+      const edge = x === 0 || x === w - 1 || i < w || i >= w * (h - 1) || m[i - 1] !== v || m[i + 1] !== v || m[i - w] !== v || m[i + w] !== v;
+      if (edge) { d[j] = Math.min(255, c[0] + 110); d[j + 1] = Math.min(255, c[1] + 60); d[j + 2] = Math.min(255, c[2] + 90); d[j + 3] = S.show ? (on[v] ? 255 : 150) : 0; }
+      else { d[j] = c[0]; d[j + 1] = c[1]; d[j + 2] = c[2]; d[j + 3] = S.show ? (on[v] ? 105 : 40) : 0; }
+    } else d[j + 3] = 0;
+  }
+  ovCtx.putImageData(ovImg, 0, 0);
+  const px = pxAreaSqft();
+  let total = 0, all = 0;
+  S.zones.forEach(z => { z.sqft = cnt[z.id] * px; all += z.sqft; if (z.on) total += z.sqft; const el = $('za' + z.id); if (el) el.textContent = fmt(z.sqft) + ' sq ft'; });
+  S.lawn = total; S.lot = lot * px;
+  $('big').innerHTML = fmt(total) + ' <small>sq ft' + (total < all - 0.5 ? ' selected' : ' of lawn') + '</small>';
+  $('sub').textContent = `${(total / 1000).toFixed(1)} K` + (total < all - 0.5 ? `  ·  all zones ${fmt(all)}` : '') + `  ·  lot ${fmt(S.lot)} sq ft (${(S.lot / 43560).toFixed(2)} ac)`;
+}
+
+// ---------- editing ----------
+function pushUndo() { if (!S.mask) return; S.undo.push(S.mask.slice()); if (S.undo.length > 30) S.undo.shift(); }
+function undo() { const m = S.undo.pop(); if (m && m.length === S.mask.length) { S.mask = m; render(); } }
+const applyAt = i => { if (S.mode === 'add') S.mask[i] = S.zone; else if (S.mode === 'erase') S.mask[i] = 0; else if (S.mask[i]) S.mask[i] = S.zone; };
+function paint(x0, y0, x1, y1) {
+  const g = S.G, r = Math.max(0.6, (+$('brush').value / 2) * g.ppf);
+  const steps = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / Math.max(1, r / 2)));
+  for (let s = 0; s <= steps; s++) {
+    const cx = x0 + (x1 - x0) * s / steps, cy = y0 + (y1 - y0) * s / steps;
+    const ya = Math.max(0, Math.floor(cy - r)), yb = Math.min(g.h - 1, Math.ceil(cy + r));
+    const xa = Math.max(0, Math.floor(cx - r)), xb = Math.min(g.w - 1, Math.ceil(cx + r));
+    for (let y = ya; y <= yb; y++) for (let x = xa; x <= xb; x++)
+      if ((x + 0.5 - cx) ** 2 + (y + 0.5 - cy) ** 2 <= r * r) applyAt(y * g.w + x);
+  }
+  S.edited = true; render();
+}
+function finishPoly() {
+  if (S.poly.length >= 3) {
+    pushUndo();
+    const g = S.G, c = document.createElement('canvas'); c.width = g.w; c.height = g.h;
+    const x = c.getContext('2d'); x.beginPath();
+    S.poly.forEach((ll, i) => { const p = toPx(ll); i ? x.lineTo(p[0], p[1]) : x.moveTo(p[0], p[1]); });
+    x.closePath(); x.fill();
+    const d = x.getImageData(0, 0, g.w, g.h).data;
+    for (let i = 0; i < g.w * g.h; i++) if (d[i * 4 + 3] > 127) applyAt(i);
+    S.edited = true; render();
+  }
+  S.poly = []; polyLine.setLatLngs([]);
+}
+function setTool(t) {
+  if (S.tool === 'poly' && t !== 'poly') { S.poly = []; polyLine.setLatLngs([]); }
+  S.tool = t;
+  document.body.classList.toggle('tool-brush', t === 'brush');
+  document.body.classList.toggle('tool-poly', t === 'poly');
+  $('tMove').classList.toggle('on', t === 'move'); $('tBrush').classList.toggle('on', t === 'brush'); $('tPoly').classList.toggle('on', t === 'poly');
+  if (t === 'move') { map.dragging.enable(); map.doubleClickZoom.enable(); } else { map.dragging.disable(); map.doubleClickZoom.disable(); }
+  if (t === 'brush') brushRing.addTo(map); else brushRing.remove();
+}
+function setMode(md) {
+  S.mode = md;
+  $('mAdd').classList.toggle('on', md === 'add'); $('mErase').classList.toggle('on', md === 'erase'); $('mAssign').classList.toggle('on', md === 'assign');
+  brushRing.setStyle({ color: md === 'erase' ? '#ff6b6b' : `rgb(${zoneColor(S.zone)})` });
+}
+function armPick(on) { S.pickArmed = on; $('pick').classList.toggle('on', on); document.body.classList.toggle('tool-pick', on); if (on) status('Click a property on the map.'); }
+
+map.on('mousedown', e => {
+  if (S.pickArmed || S.tool !== 'brush' || !S.G || e.originalEvent.button !== 0) return;
+  pushUndo(); S.drawing = true; S.last = toPx(e.latlng); paint(S.last[0], S.last[1], S.last[0], S.last[1]);
+});
+map.on('mousemove', e => {
+  if (S.tool === 'brush') { brushRing.setLatLng(e.latlng); brushRing.setRadius(+$('brush').value / 2 * FT); }
+  if (S.drawing) { const p = toPx(e.latlng); paint(S.last[0], S.last[1], p[0], p[1]); S.last = p; }
+  if (S.tool === 'poly' && S.poly.length) polyLine.setLatLngs([...S.poly, e.latlng]);
+});
+window.addEventListener('mouseup', () => { S.drawing = false; });
+map.on('click', async e => {
+  if (S.pickArmed) { armPick(false); try { await loadParcelAt(e.latlng); } catch (err) { status(err.message, true); } return; }
+  if (S.tool === 'poly' && S.G) { S.poly.push(e.latlng); polyLine.setLatLngs(S.poly); }
+});
+map.on('dblclick', () => { if (S.tool === 'poly') { S.poly.pop(); finishPoly(); } });
+
+$('tMove').onclick = () => setTool('move'); $('tBrush').onclick = () => setTool('brush'); $('tPoly').onclick = () => setTool('poly');
+$('mAdd').onclick = () => setMode('add'); $('mErase').onclick = () => setMode('erase'); $('mAssign').onclick = () => setMode('assign');
+$('brush').oninput = () => { $('bsz').textContent = $('brush').value + ' ft'; };
+$('undo').onclick = undo;
+$('clear').onclick = () => { pushUndo(); S.mask.fill(0); S.edited = true; render(); };
+$('show').onclick = () => { S.show = !S.show; $('show').classList.toggle('on', S.show); render(); };
+$('redo').onclick = detect; $('sens').onchange = detect; $('clip').onchange = detect;
+$('pick').onclick = () => armPick(!S.pickArmed);
+$('lines').onclick = () => { const on = !map.hasLayer(linesLayer); on ? linesLayer.addTo(map) : linesLayer.remove(); $('lines').classList.toggle('on', on); if (on && map.getZoom() < 16) status('Zoom in to see property lines.'); };
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' && e.target.type === 'text') return;
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); return undo(); }
+  if (!S.G || e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  if (k === 'v') setTool('move'); else if (k === 'b') setTool('brush'); else if (k === 'p') setTool('poly');
+  else if (k === 'x') setMode({ add: 'erase', erase: 'assign', assign: 'add' }[S.mode]);
+  else if (k === 'enter' && S.tool === 'poly') finishPoly();
+  else if (k === 'escape') { S.poly = []; polyLine.setLatLngs([]); armPick(false); }
+  else if (k === '[' || k === ']') { const b = $('brush'); b.value = +b.value + (k === ']' ? 2 : -2); b.oninput(); }
+  else if (k >= '1' && k <= '9' && S.zones[+k - 1]) { S.zone = S.zones[+k - 1].id; buildZones(); setMode(S.mode); }
+});
+
+// ---------- save / load / export ----------
+const KEY = 'lawnmap.saved.v1';
+const loadSaved = () => { try { return JSON.parse(localStorage.getItem(KEY)) || []; } catch (e) { return []; } };
+function storeSaved(list) { try { localStorage.setItem(KEY, JSON.stringify(list)); return true; } catch (e) { status('Could not save (browser storage is full or blocked).', true); return false; } }
+function maskToPNG() {   // zone id is stored in the red channel (id * 20)
+  const g = S.G, c = document.createElement('canvas'); c.width = g.w; c.height = g.h;
+  const x = c.getContext('2d'), im = x.createImageData(g.w, g.h);
+  for (let i = 0; i < g.w * g.h; i++) { const v = S.mask[i] * 20; im.data[i * 4] = im.data[i * 4 + 1] = im.data[i * 4 + 2] = v; im.data[i * 4 + 3] = 255; }
+  x.putImageData(im, 0, 0); return c.toDataURL('image/png');
+}
+function pngToMask(url, w, h, zoned) {
+  return new Promise((res, rej) => { const img = new Image(); img.onload = () => {
+    const c = document.createElement('canvas'); c.width = w; c.height = h; const x = c.getContext('2d'); x.imageSmoothingEnabled = false; x.drawImage(img, 0, 0, w, h);
+    const d = x.getImageData(0, 0, w, h).data, m = new Uint8Array(w * h);
+    for (let i = 0; i < w * h; i++) m[i] = zoned ? Math.round(d[i * 4] / 20) : (d[i * 4] > 127 ? 1 : 0);
+    res(m); };
+    img.onerror = rej; img.src = url; });
+}
+const zoneText = zs => (zs || []).filter(z => z.sqft > 0.5).map(z => `${z.name} ${fmt(z.sqft)}${z.on === false ? ' (not counted)' : ''}`).join(', ');
+function listSaved() {
+  const ul = $('saved'), list = loadSaved(); ul.innerHTML = '';
+  if (!list.length) { const li = document.createElement('li'); li.style.cursor = 'default'; li.innerHTML = '<span class="n">Nothing saved yet.</span>'; ul.appendChild(li); return; }
+  list.forEach(rec => {
+    const li = document.createElement('li');
+    const a = document.createElement('span'); a.className = 'a'; a.textContent = rec.label; a.title = zoneText(rec.zones);
+    const n = document.createElement('span'); n.className = 'n'; n.textContent = fmt(rec.lawn) + ' sq ft';
+    const x = document.createElement('span'); x.className = 'x'; x.textContent = '✕'; x.title = 'Delete';
+    x.onclick = e => { e.stopPropagation(); if (confirm('Delete the saved measurement for ' + rec.label + '?')) { storeSaved(loadSaved().filter(r => r.id !== rec.id)); listSaved(); } };
+    const right = document.createElement('span'); right.style.display = 'flex'; right.style.gap = '6px'; right.append(n, x);
+    li.append(a, right);
+    li.onclick = async () => {
+      try {
+        await openParcel({ attrs: rec.attrs, rings: rec.rings, label: rec.label, pt: rec.pt }, rec);
+        if (rec.w === S.G.w && rec.h === S.G.h) { S.mask = await pngToMask(rec.mask, rec.w, rec.h, !!rec.zones); S.undo = []; S.edited = true; render(); }
+        else { detect(); status('Saved outline did not fit; re-detected.', true); }
+      } catch (e) { status(e.message, true); }
+    };
+    ul.appendChild(li);
+  });
+}
+$('save').onclick = () => {
+  if (!S.parcel) return;
+  draw();   // make sure the totals reflect the latest edit
+  const a = S.parcel.attrs || {}, id = a.parno ? String(a.parno) + '|' + (a.cntyname || '') : S.parcel.label;
+  const rec = { id, label: S.parcel.label, attrs: a, rings: S.parcel.rings, pt: S.parcel.pt, lawn: Math.round(S.lawn), lot: Math.round(S.lot),
+    zones: S.zones.map(z => ({ id: z.id, name: z.name, on: z.on, sqft: Math.round(z.sqft || 0) })),
+    date: new Date().toISOString().slice(0, 10), w: S.G.w, h: S.G.h, mask: maskToPNG() };
+  const list = loadSaved().filter(r => r.id !== id); list.unshift(rec);
+  if (storeSaved(list)) { listSaved(); status('Saved.'); }
+};
+function download(name, url) { const a = document.createElement('a'); a.download = name; a.href = url; document.body.appendChild(a); a.click(); a.remove(); }
+const safeName = s => String(s).replace(/[^\w]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 60) || 'lawn';
+$('csv').onclick = () => {
+  const list = loadSaved(); if (!list.length) return status('Nothing saved to export yet.', true);
+  const q = v => '"' + String(v == null ? '' : v).replace(/"/g, '""') + '"';
+  const rows = [['Address', 'County', 'Parcel', 'Lawn sq ft (counted zones)', 'Zones', 'Lot sq ft', 'Date']]
+    .concat(list.map(r => [r.label, (r.attrs || {}).cntyname, (r.attrs || {}).parno, r.lawn, zoneText(r.zones), r.lot, r.date]));
+  download('lawnmap.csv', URL.createObjectURL(new Blob([rows.map(r => r.map(q).join(',')).join('\r\n')], { type: 'text/csv' })));
+};
+$('png').onclick = () => {
+  const g = S.G; if (!g || !S.rgb) return status('Imagery is not loaded yet.', true);
+  const scale = Math.max(1, Math.min(4, Math.round(1100 / Math.max(g.w, g.h)))), bar = 88;
+  const base = document.createElement('canvas'); base.width = g.w; base.height = g.h;
+  base.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(S.rgb), g.w, g.h), 0, 0);
+  const wasShown = S.show; S.show = true; draw();
+  const c = document.createElement('canvas'); c.width = g.w * scale; c.height = g.h * scale + bar;
+  const x = c.getContext('2d'), H = g.h * scale;
+  x.drawImage(base, 0, 0, c.width, H);
+  x.imageSmoothingEnabled = false; x.drawImage(ovCanvas, 0, 0, c.width, H);
+  x.strokeStyle = '#ffd84a'; x.lineWidth = 2; x.beginPath();
+  S.parcel.rings.forEach(r => { r.forEach((p, i) => { const q = toPx(L.latLng(p[1], p[0])); i ? x.lineTo(q[0] * scale, q[1] * scale) : x.moveTo(q[0] * scale, q[1] * scale); }); x.closePath(); });
+  x.stroke();
+  x.fillStyle = '#14181c'; x.fillRect(0, H, c.width, bar);
+  x.textBaseline = 'middle';
+  x.fillStyle = '#e8edf1'; x.font = '600 18px system-ui, Segoe UI, sans-serif'; x.fillText(S.parcel.label, 14, H + 20, c.width - 28);
+  x.fillStyle = '#3ddc84'; x.font = '700 18px system-ui, Segoe UI, sans-serif';
+  const head = `${fmt(S.lawn)} sq ft`; x.fillText(head, 14, H + 45);
+  x.fillStyle = '#93a0ab'; x.font = '14px system-ui, Segoe UI, sans-serif';
+  x.fillText(`lot ${fmt(S.lot)} sq ft  ·  ${new Date().toLocaleDateString('en-US')}`, 30 + x.measureText(head).width * 1.3, H + 45);
+  let lx = 14;   // zone legend
+  S.zones.filter(z => z.sqft > 0.5).forEach(z => {
+    x.fillStyle = `rgb(${zoneColor(z.id)})`; x.fillRect(lx, H + 62, 12, 12);
+    x.fillStyle = z.on ? '#e8edf1' : '#93a0ab'; const t = `${z.name} ${fmt(z.sqft)}${z.on ? '' : ' (not counted)'}`;
+    x.fillText(t, lx + 18, H + 69); lx += 34 + x.measureText(t).width;
+  });
+  S.show = wasShown; draw();
+  download(safeName(S.parcel.label) + '.png', c.toDataURL('image/png'));
+};
+
+listSaved();
+const LM = window.LM = { S, FEATS, detect, classify, search, loadParcelAt, map, keep: false, model: null };   // test hooks
+</script>
+</body>
+</html>
