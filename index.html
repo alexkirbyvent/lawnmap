@@ -58,7 +58,7 @@
   .hint { color:var(--dim); font-size:12px; margin-top:8px; }
   .hide { display:none !important; }
   .leaflet-container { font:inherit; }
-  .lm-overlay { image-rendering:pixelated; pointer-events:none; }
+  .lm-overlay { pointer-events:none; }
   body.tool-brush #map, body.tool-poly #map, body.tool-pick #map { cursor:crosshair; }
   @media (max-width: 760px) { body { flex-direction:column-reverse; } #side { width:100%; height:48%; border-right:0; border-top:1px solid var(--line); } }
 </style>
@@ -512,6 +512,67 @@ function blobs(mask, w, h, val, fn) {
   }
 }
 
+// ---------- outline clean-up ----------
+// Follow the boundary of a 0/1 mask along pixel edges. Returns closed loops as flat [x0,y0,x1,y1,...] arrays
+// (outer edges run clockwise, holes counter-clockwise).
+function traceLoops(m, w, h) {
+  const W = w + 1, nv = W * (h + 1), o1 = new Int32Array(nv).fill(-1), o2 = new Int32Array(nv).fill(-1);
+  const add = (a, b) => { if (o1[a] < 0) o1[a] = b; else o2[a] = b; };
+  for (let y = 0, i = 0; y < h; y++) for (let x = 0; x < w; x++, i++) {
+    if (!m[i]) continue;
+    const v = y * W + x;
+    if (y === 0 || !m[i - w]) add(v, v + 1);
+    if (x === w - 1 || !m[i + 1]) add(v + 1, v + 1 + W);
+    if (y === h - 1 || !m[i + w]) add(v + 1 + W, v + W);
+    if (x === 0 || !m[i - 1]) add(v + W, v);
+  }
+  const loops = [], vx = v => v % W, vy = v => (v - v % W) / W;
+  for (let s = 0; s < nv; s++) while (o1[s] >= 0) {
+    const pts = []; let v = s, prev = -1;
+    do {
+      pts.push(vx(v), vy(v));
+      let nx;
+      if (o2[v] >= 0) {   // two ways out (pixels touching at a corner): take the tighter, right-hand turn
+        const a = o1[v], b = o2[v]; let pick = a;
+        if (prev >= 0) { const dx = vx(v) - vx(prev), dy = vy(v) - vy(prev), turn = t => dx * (vy(t) - vy(v)) - dy * (vx(t) - vx(v)); if (turn(b) > turn(a)) pick = b; }
+        o1[v] = pick === a ? b : a; o2[v] = -1; nx = pick;
+      } else { nx = o1[v]; o1[v] = -1; }
+      prev = v; v = nx;
+    } while (v !== s && v >= 0);
+    if (pts.length >= 8) loops.push(pts);
+  }
+  return loops;
+}
+// Douglas-Peucker: mark which points of pts[a..b] to keep so the outline stays within `eps` pixels of the original
+function simplify(pts, a, b, eps, keep) {
+  const stack = [a, b];
+  while (stack.length) {
+    const e = stack.pop(), s = stack.pop(), ax = pts[2 * s], ay = pts[2 * s + 1], dx = pts[2 * e] - ax, dy = pts[2 * e + 1] - ay, len = Math.hypot(dx, dy) || 1;
+    let md = 0, mi = -1;
+    for (let i = s + 1; i < e; i++) { const d = Math.abs((pts[2 * i] - ax) * dy - (pts[2 * i + 1] - ay) * dx) / len; if (d > md) { md = d; mi = i; } }
+    if (md > eps) { keep[mi] = 1; stack.push(s, mi, mi, e); }
+  }
+}
+// Redraw a mask from its simplified outlines: ragged pixel edges become straight-sided polygons.
+function straighten(m, w, h, eps) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const x = c.getContext('2d', { willReadFrequently: true }); x.beginPath();
+  for (const pts of traceLoops(m, w, h)) {
+    const N = pts.length / 2; let far = 0, fd = 0;
+    for (let i = 1; i < N; i++) { const d = (pts[2 * i] - pts[0]) ** 2 + (pts[2 * i + 1] - pts[1]) ** 2; if (d > fd) { fd = d; far = i; } }
+    pts.push(pts[0], pts[1]);
+    const keep = new Uint8Array(N + 1); keep[0] = keep[far] = keep[N] = 1;
+    simplify(pts, 0, far, eps, keep); simplify(pts, far, N, eps, keep);
+    let k = 0;
+    for (let i = 0; i < N; i++) if (keep[i]) { k++ ? x.lineTo(pts[2 * i], pts[2 * i + 1]) : x.moveTo(pts[2 * i], pts[2 * i + 1]); }
+    x.closePath();
+  }
+  x.fill('evenodd');
+  const d = x.getImageData(0, 0, w, h).data, out = new Uint8Array(w * h);
+  for (let i = 0; i < out.length; i++) out[i] = d[i * 4 + 3] > 127 ? 1 : 0;
+  return out;
+}
+
 // ---------- lawn classifier ----------
 // Per-pixel colour and texture features from the state's 6-inch aerial photo. A small neural net, fitted to
 // hand-labelled lots around Wake, Franklin and Granville counties, turns them into a lawn probability.
@@ -671,14 +732,14 @@ function detect() {
   const px = pxAreaSqft(), r = Math.max(1, Math.round(1 * ppf));
   // spread from the starting set into touching pixels that pass `test`, at most `maxSteps` pixels outward
   // (only patches of at least `seedSqft` may spread, so a stray speck cannot flood a shaded or marginal area)
-  const grow = (test, maxSteps, seedSqft) => {
-    blobs(m, w, h, 1, (p, cnt) => { if (cnt * px < seedSqft) for (const i of p) m[i] = 2; });
+  const grow = (test, maxSteps, seedSqft, allowed = ok) => {
+    if (seedSqft) blobs(m, w, h, 1, (p, cnt) => { if (cnt * px < seedSqft) for (const i of p) m[i] = 2; });
     let front = [];
     for (let i = 0; i < n; i++) if (m[i] === 1) front.push(i);
     for (let step = 0; step < maxSteps && front.length; step++) {
       const next = [];
       for (const i of front) { const x = i % w;
-        for (const j of [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, i - w, i + w]) if (j >= 0 && j < n && !m[j] && ok(j) && test(j)) { m[j] = 1; next.push(j); } }
+        for (const j of [x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, i - w, i + w]) if (j >= 0 && j < n && !m[j] && allowed(j) && test(j)) { m[j] = 1; next.push(j); } }
       front = next;
     }
     for (let i = 0; i < n; i++) if (m[i] === 2) m[i] = 1;
@@ -703,9 +764,37 @@ function detect() {
     // small holes always fill; bigger ones only when they are a tree standing in the lawn (canopy ringed by grass)
     if (blocked < cnt * 0.3 && (cnt * px <= 250 || trees > cnt * 0.6)) for (const i of p) if (ok(i)) m[i] = 1;
   });
+  // 5. snap the edge out to where the grass actually stops. The steps above leave a margin of a few feet beside
+  //    driveways, walks and beds; here the lawn spreads into touching pixels whose colour matches the lawn right next
+  //    to them, and stops at the colour change (pavement, mulch, shadow). Buildings and the lot line still block it.
+  //    Pixels the hard-surface model flagged must match the lawn colour much more closely, which keeps a dirt or gravel
+  //    drive that is only a little lighter than the lawn from being swallowed.
+  const ok2 = i => (!clip || S.inParcel[i]) && !(bld && bld[i]);
+  {
+    const rgb = S.rgb, r5 = Math.max(3, Math.round(5 * ppf));
+    const mf = new Float32Array(n), cr = new Float32Array(n), cg = new Float32Array(n), cb = new Float32Array(n);
+    for (let i = 0, j = 0; i < n; i++, j += 4) if (m[i]) { mf[i] = 1; cr[i] = rgb[j] / 255; cg[i] = rgb[j + 1] / 255; cb[i] = rgb[j + 2] / 255; }
+    const bm = boxMean(mf, w, h, r5), br = boxMean(cr, w, h, r5), bg = boxMean(cg, w, h, r5), bb = boxMean(cb, w, h, r5);
+    const like = new Uint8Array(n);
+    for (let i = 0, j = 0; i < n; i++, j += 4) {
+      if (m[i] || bm[i] < 0.06 || !ok2(i) || woods(i)) continue;
+      const d = Math.abs(rgb[j] / 255 - br[i] / bm[i]) + Math.abs(rgb[j + 1] / 255 - bg[i] / bm[i]) + Math.abs(rgb[j + 2] / 255 - bb[i] / bm[i]);
+      if (d < (hard && hard[i] ? 0.07 : 0.15)) like[i] = 1;
+    }
+    grow(j => like[j], Math.round(8 * ppf), 0, ok2);
+    m = morph(morph(m, w, h, r, true), w, h, r, false);
+    blobs(m, w, h, 0, (p, cnt, border) => {   // fill leftover pinholes, but not ones that are mostly hard surface
+      if (border || cnt * px > 150) return;
+      let hd = 0; if (hard) for (const i of p) hd += hard[i];
+      if (hd < cnt * 0.5) for (const i of p) if (ok2(i)) m[i] = 1;
+    });
+  }
+  // 6. straighten: turn the ragged pixel outline into clean polygons with straight sides
+  m = straighten(m, w, h, 1.1 * ppf);
+  for (let i = 0; i < n; i++) if (m[i] && !ok2(i)) m[i] = 0;
   // on big lots, drop stray patches that are tiny next to the real lawn (specks out in the woods)
   let total = 0; for (let i = 0; i < n; i++) total += m[i];
-  blobs(m, w, h, 1, (p, cnt) => { if (cnt < total * 0.006) for (const i of p) m[i] = 0; });
+  blobs(m, w, h, 1, (p, cnt) => { if (cnt < total * 0.006 || cnt * px < 120) for (const i of p) m[i] = 0; });
   splitZones(m);
   S.mask = m;
   render();
