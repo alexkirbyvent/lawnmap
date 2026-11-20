@@ -166,7 +166,7 @@ const FT = 0.3048;
 const PAD_FT = 25;          // imagery margin around the parcel
 const TARGET_RES_FT = 0.5;  // native imagery resolution
 const MAX_DIM = 2200;       // caps on analysis image size
-const MAX_PX = 1.6e6;
+const MAX_PX = 1.8e6;
 const ZCOL = [[61, 220, 132], [80, 160, 255], [255, 170, 60], [200, 120, 255], [255, 110, 140], [90, 220, 220], [230, 230, 90], [255, 140, 90]];
 
 const $ = id => document.getElementById(id);
@@ -345,7 +345,7 @@ async function loadParcelAt(ll, label) {
 
 async function openParcel(parcel, saved) {
   S.parcel = parcel; S.undo = []; S.poly = []; polyLine.setLatLngs([]);
-  S.prob = S.imperv = S.front = S.bld = S.dark = S.shadeVeg = S.hard = S.summer = null; S.edited = false;
+  S.prob = S.imperv = S.front = S.bld = S.dark = S.shadeVeg = S.hard = S.summer = S.canopy = null; S.edited = false;
   S.zones = saved && saved.zones ? saved.zones.map(z => ({ id: z.id, name: z.name, on: z.on !== false })) : defaultZones();
   S.zone = S.zones[0].id;
   const latlngs = parcel.rings.map(r => r.map(p => L.latLng(p[1], p[0])));
@@ -558,13 +558,20 @@ function computeFeatures() {
     nd3 = boxMean(ndvi, w, h, r3); nir3 = boxMean(nir, w, h, r3);
   }
   // summer photo (USDA, sun high so shadows are short): how green each spot is in summer, used to see what the winter shadows hide
-  let ndS = null;
+  // It also shows tree canopy: leafed-out trees are darker in red light and much rougher than turf. Bare winter woods
+  // look a lot like dormant grass from above, so this is what keeps wooded parts of a lot from being marked.
+  let ndS = null, canopy = null;
   if (S.summer) {
-    const sm = S.summer, k = nirGain(sm, gray, n), raw = mk();
-    for (let i = 0, j = 0; i < n; i++, j += 4) { const N = Math.min(1.6, k * sm[j] / 255), R = sm[j + 1] / 255; raw[i] = (N - R) / (N + R + 1e-6); }
-    ndS = boxMean(raw, w, h, r3);
+    const sm = S.summer, N = mk(), R = mk();
+    for (let i = 0, j = 0; i < n; i++, j += 4) { N[i] = sm[j] / 255; R[i] = sm[j + 1] / 255; }
+    const Nb = boxMean(N, w, h, r3), Rb = boxMean(R, w, h, r3), rough = tex(N, r8, r8);
+    ndS = mk(); canopy = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+      const nd = (Nb[i] - Rb[i]) / (Nb[i] + Rb[i] + 1e-6); ndS[i] = nd;
+      canopy[i] = nd > 0.34 && (Rb[i] < 0.30 || rough[i] > 0.028) ? 1 : 0;   // turf: red >= ~0.32, roughness <= ~0.024
+    }
   }
-  return { X, nd3, nir3, ndS };
+  return { X, nd3, nir3, ndS, canopy };
 }
 function predict(X, n, model) {
   const D = model.mean.length, out = new Float32Array(n), cols = model.cols || [...Array(D).keys()];
@@ -583,8 +590,9 @@ function predict(X, n, model) {
 }
 function classify() {
   const { w, h, ppf } = S.G, n = w * h;
-  const { X, nd3: nd, nir3, ndS } = computeFeatures();
+  const { X, nd3: nd, nir3, ndS, canopy } = computeFeatures();
   if (LM.keep) { S.X = X; S.nd3 = nd; S.nir3 = nir3; S.ndS = ndS; }
+  S.canopy = canopy;
   // Two colour/texture models: how likely each pixel is lawn, and how likely it is a hard surface (roof, driveway,
   // street, patio). In testing on unseen lots, colour did as well as models that also used infrared, and it always
   // matches the newest photo.
@@ -599,11 +607,13 @@ function classify() {
   const dark = new Uint8Array(n), shadeVeg = new Uint8Array(n), hard = new Uint8Array(n), b3 = X[6];
   for (let i = 0; i < n; i++) {
     dark[i] = b3[i] < 0.3 ? 1 : 0;
-    // (summer greenness between 0.2 and 0.45 is the turf range; higher than that is usually tree canopy overhead)
-    if (b3[i] < 0.27 && (!nir3 || nir3[i] < 0.45)) shadeVeg[i] = (nd && nd[i] > 0.2) || (ndS && ndS[i] > 0.2 && ndS[i] < 0.45) ? 1 : 0;
+    // A deciduous tree over turf: under summer canopy, but the winter infrared still shows green at ground level
+    // (and it is not evergreen canopy, which is dark to the eye yet bright in infrared). Treated as open ground.
+    if (canopy && canopy[i] && nd && nd[i] > 0.3 && !(b3[i] < 0.3 && nir3[i] > 0.5)) canopy[i] = 2;
+    if (b3[i] < 0.27 && (!nir3 || nir3[i] < 0.45) && !(canopy && canopy[i] === 1)) shadeVeg[i] = (nd && nd[i] > 0.2) || (ndS && ndS[i] > 0.2 && !canopy[i]) ? 1 : 0;
     // hard surface: the hard-surface model says so more confidently than the lawn model says lawn - unless the spot is
     // green in the summer photo, which rules out pavement (pale dormant turf looks a lot like concrete in winter)
-    hard[i] = probH && probH[i] > 0.5 && probH[i] > S.prob[i] && !(ndS && ndS[i] > 0.18) ? 1 : 0;
+    hard[i] = probH && probH[i] > 0.5 && probH[i] > S.prob[i] && !(ndS && ndS[i] > 0.2) ? 1 : 0;
   }
   S.dark = dark; S.shadeVeg = nd || ndS ? shadeVeg : null; S.hard = hard;
   // roofs and pavement inside the parcel, for finding the house when no footprint is mapped
@@ -654,7 +664,10 @@ function detect() {
   let m = new Uint8Array(n);
   // never lawn: outside the lot (if clipping), a mapped building, or a detected hard surface (roof, driveway, street, patio)
   const bld = S.bld, hard = S.hard, ok = i => (!clip || S.inParcel[i]) && !(bld && bld[i]) && !(hard && hard[i]);
-  for (let i = 0; i < n; i++) m[i] = S.prob[i] > thr && ok(i) ? 1 : 0;
+  // under summer tree canopy only unmistakable lawn counts (grass seen through bare branches); marginal ground there is woods
+  // (canopy value 2 = tree over visibly green turf, which is treated as open for everything except the patchy-turf spread)
+  const can = S.canopy, open = i => !(can && can[i]), woods = i => can && can[i] === 1, thrCan = Math.min(0.95, thr + 0.3);
+  for (let i = 0; i < n; i++) m[i] = S.prob[i] > (woods(i) ? thrCan : thr) && ok(i) ? 1 : 0;
   const px = pxAreaSqft(), r = Math.max(1, Math.round(1 * ppf));
   // spread from the starting set into touching pixels that pass `test`, at most `maxSteps` pixels outward
   // (only patches of at least `seedSqft` may spread, so a stray speck cannot flood a shaded or marginal area)
@@ -672,10 +685,10 @@ function detect() {
   };
   // 1. thin or patchy turf next to confident lawn counts too (this is what keeps the fill from being blotchy)
   const weak = thr * 0.45, P = S.prob;
-  grow(j => P[j] > weak, Math.round(40 * ppf), 60);
+  grow(j => P[j] > weak && open(j), Math.round(30 * ppf), 60);
   // 2. bridge thin shadows (bare branches, fences) that cut across a lawn: close gaps up to ~8 ft wide through dark pixels
   const rb = Math.max(2, Math.round(4 * ppf)), closed = morph(morph(m, w, h, rb, true), w, h, rb, false);
-  for (let i = 0; i < n; i++) if (!m[i] && closed[i] && S.dark[i] && ok(i)) m[i] = 1;
+  for (let i = 0; i < n; i++) if (!m[i] && closed[i] && S.dark[i] && ok(i) && !woods(i)) m[i] = 1;
   // 3. grow into adjoining house / tree shadow that infrared or the summer photo shows is vegetation, up to ~40 ft
   if (S.shadeVeg) { const sv = S.shadeVeg; grow(j => sv[j], Math.round(30 * ppf), 200); }
   // 4. tidy: close small gaps, drop slivers and specks, fill small holes (tree trunks, leftover shadow) unless they are hard surface
@@ -683,12 +696,16 @@ function detect() {
   m = morph(morph(m, w, h, r2, true), w, h, r2, false);
   for (let i = 0; i < n; i++) if (m[i] && !ok(i)) m[i] = 0;
   m = morph(morph(m, w, h, r, false), w, h, r, true);
-  blobs(m, w, h, 1, (p, cnt) => { if (cnt * px < 80) for (const i of p) m[i] = 0; });
+  blobs(m, w, h, 1, (p, cnt) => { if (cnt * px < 120) for (const i of p) m[i] = 0; });
   blobs(m, w, h, 0, (p, cnt, border) => {
-    if (border || cnt * px > 250) return;
-    let blocked = 0; for (const i of p) if (!ok(i)) blocked++;
-    if (blocked < cnt * 0.3) for (const i of p) if (ok(i)) m[i] = 1;
+    if (border || cnt * px > 2000) return;
+    let blocked = 0, trees = 0; for (const i of p) { if (!ok(i)) blocked++; else if (!open(i)) trees++; }
+    // small holes always fill; bigger ones only when they are a tree standing in the lawn (canopy ringed by grass)
+    if (blocked < cnt * 0.3 && (cnt * px <= 250 || trees > cnt * 0.6)) for (const i of p) if (ok(i)) m[i] = 1;
   });
+  // on big lots, drop stray patches that are tiny next to the real lawn (specks out in the woods)
+  let total = 0; for (let i = 0; i < n; i++) total += m[i];
+  blobs(m, w, h, 1, (p, cnt) => { if (cnt < total * 0.006) for (const i of p) m[i] = 0; });
   splitZones(m);
   S.mask = m;
   render();
