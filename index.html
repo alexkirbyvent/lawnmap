@@ -63,6 +63,12 @@
   #mapWrap { flex:1; position:relative; display:flex; min-width:0; min-height:0; }
   #busy { position:absolute; z-index:1500; top:16px; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:10px;
     padding:10px 16px; border-radius:999px; background:#14181cee; border:1px solid var(--line); color:var(--text); font-weight:600; box-shadow:0 6px 20px #0008; white-space:nowrap; }
+  .askPop .leaflet-popup-content-wrapper, .askPop .leaflet-popup-tip { background:var(--panel); color:var(--text); }
+  .askPop .leaflet-popup-content { margin:12px; }
+  .ask { display:flex; flex-direction:column; gap:8px; min-width:200px; font-weight:600; }
+  .ask button { font-weight:500; }
+  button.danger { background:#e5484d; color:#fff; border-color:transparent; font-weight:700; }
+  button.danger:hover { background:#f2555a; }
   .spin { width:16px; height:16px; border-radius:50%; border:3px solid #ffffff33; border-top-color:var(--accent); animation:spin .8s linear infinite; }
   @keyframes spin { to { transform:rotate(360deg); } }
   @media (max-width: 760px) { body { flex-direction:column-reverse; } #side { width:100%; height:48%; border-right:0; border-top:1px solid var(--line); } }
@@ -332,7 +338,7 @@ async function loadParcelAt(ll, label) {
 
 async function openParcel(parcel, saved) {
   S.parcel = parcel; S.undo = []; if (out.mode) cancelOutline();
-  S.prob = S.imperv = S.front = S.bld = S.dark = S.shadeVeg = S.hard = S.summer = S.canopy = null; S.edited = false;
+  S.prob = S.imperv = S.front = S.bld = S.dark = S.shadeVeg = S.hard = S.summer = S.canopy = S.hilite = null; S.edited = false;
   S.zones = saved && saved.zones ? saved.zones.map(z => ({ id: z.id, name: z.name, on: z.on !== false })) : defaultZones();
   S.zone = S.zones[0].id;
   const latlngs = parcel.rings.map(r => r.map(p => L.latLng(p[1], p[0])));
@@ -616,7 +622,9 @@ function computeFeatures() {
     ndS = mk(); canopy = new Uint8Array(n);
     for (let i = 0; i < n; i++) {
       const nd = (Nb[i] - Rb[i]) / (Nb[i] + Rb[i] + 1e-6); ndS[i] = nd;
-      canopy[i] = nd > 0.34 && (Rb[i] < 0.30 || rough[i] > 0.028) ? 1 : 0;   // turf: red >= ~0.32, roughness <= ~0.024
+      // canopy is green AND rough. (Darkness alone is not enough: a tree line's shadow lying on the lawn is dark too,
+      // but smooth, and must not be mistaken for trees.)  turf roughness <= ~0.024, canopy >= ~0.030
+      canopy[i] = nd > 0.34 && rough[i] > 0.026 ? 1 : 0;
     }
   }
   return { X, nd3, nir3, ndS, canopy };
@@ -770,7 +778,12 @@ function detect() {
   const rb = Math.max(2, Math.round(4 * ppf)), closed = morph(morph(m, w, h, rb, true), w, h, rb, false);
   for (let i = 0; i < n; i++) if (!m[i] && closed[i] && S.dark[i] && ok(i) && !woods(i)) m[i] = 1;
   // 3. grow into adjoining house / tree shadow that infrared or the summer photo shows is vegetation, up to ~40 ft
-  if (S.shadeVeg) { const sv = S.shadeVeg; grow(j => sv[j], Math.round(30 * ppf), 200); }
+  //    (a long tree-line shadow across a big lawn can be 60 ft deep, so the reach scales with the size of the lawn)
+  if (S.shadeVeg) {
+    let big0 = 0; blobs(m, w, h, 1, (p, cnt) => { if (cnt > big0) big0 = cnt; });
+    const reach = Math.max(30, Math.min(80, 0.25 * Math.sqrt(big0 * px))), sv = S.shadeVeg;
+    grow(j => sv[j], Math.round(reach * ppf), 200);
+  }
   // 4. tidy: close small gaps, drop slivers and specks, fill small holes (tree trunks, leftover shadow) unless they are hard surface
   const r2 = Math.max(2, Math.round(2 * ppf));
   m = morph(morph(m, w, h, r2, true), w, h, r2, false);
@@ -812,7 +825,7 @@ function detect() {
   //    small yard, up to 6 ft on an acre): fill inlets, shave spurs, fill holes that are not a building or pavement,
   //    drop patches that are small next to the main lawn, then redraw the outline with straight sides.
   let biggest = 0; blobs(m, w, h, 1, (p, cnt) => { if (cnt > biggest) biggest = cnt; });
-  const smooth = Math.max(1.5, Math.min(6, Math.sqrt(biggest * px) * 0.02)), rc = Math.max(2, Math.round(smooth * ppf)), ro = Math.max(1, Math.round(smooth * 0.6 * ppf));
+  const smooth = Math.max(2, Math.min(8, Math.sqrt(biggest * px) * 0.03)), rc = Math.max(2, Math.round(smooth * ppf)), ro = Math.max(1, Math.round(smooth * 0.6 * ppf));
   const filled = morph(morph(m, w, h, rc, true), w, h, rc, false);
   for (let i = 0; i < n; i++) if (!m[i] && filled[i] && ok(i)) m[i] = 1;
   m = morph(morph(m, w, h, ro, false), w, h, ro, true);
@@ -826,10 +839,13 @@ function detect() {
     let conf = 0; for (let k = 0; k < p.length; k += 4) conf += P[p[k]];
     // drop patches that are small next to the main lawn, or that were built almost entirely out of shadow and weak
     // evidence (the fringe of the woods) rather than ground the model actually recognised as turf
-    if (cnt < biggest * 0.05 || cnt * px < 200 || conf / Math.ceil(p.length / 4) < 0.55) for (const i of p) m[i] = 0;
+    //    Anything other than the main lawn has to be clearly turf (average confidence 72%+) to be kept at all.
+    if (cnt < biggest * 0.05 || cnt * px < 200 || (cnt < biggest && conf / Math.ceil(p.length / 4) < 0.72)) for (const i of p) m[i] = 0;
   });
-  m = straighten(m, w, h, Math.min(3, smooth) * ppf);
-  for (let i = 0; i < n; i++) if (m[i] && !ok2(i)) m[i] = 0;
+  // long straight sides: the outline may move up to `smooth` feet, but never onto a building or the middle of pavement
+  m = straighten(m, w, h, smooth * 0.75 * ppf);
+  const hardCore = hard ? morph(hard, w, h, Math.max(2, Math.round(1.5 * ppf)), false) : null;
+  for (let i = 0; i < n; i++) if (m[i] && (!ok2(i) || (hardCore && hardCore[i]))) m[i] = 0;
   blobs(m, w, h, 1, (p, cnt) => { if (cnt * px < 200) for (const i of p) m[i] = 0; });   // crumbs left by the redraw
   splitZones(m);
   S.mask = m;
@@ -873,7 +889,7 @@ function draw() {
     const v = m[i];
     if (v) {
       cnt[v]++;
-      const x = i % w, c = col[v] || ZCOL[0];
+      const x = i % w, c = S.hilite && S.hilite[i] ? [255, 70, 70] : col[v] || ZCOL[0];   // red = shape selected for removal
       const edge = x === 0 || x === w - 1 || i < w || i >= w * (h - 1) || m[i - 1] !== v || m[i + 1] !== v || m[i - w] !== v || m[i + w] !== v;
       if (edge) { d[j] = Math.min(255, c[0] + 110); d[j + 1] = Math.min(255, c[1] + 60); d[j + 2] = Math.min(255, c[2] + 90); d[j + 3] = S.show ? (on[v] ? 255 : 150) : 0; }
       else { d[j] = c[0]; d[j + 1] = c[1]; d[j + 2] = c[2]; d[j + 3] = S.show ? (on[v] ? 105 : 40) : 0; }
@@ -899,7 +915,8 @@ const outFill = L.polygon([], { weight: 2, fillOpacity: 0.2, interactive: false 
 const outBand = L.polyline([], { weight: 2, dashArray: '6 6', interactive: false }).addTo(map);
 const outDots = L.layerGroup().addTo(map);
 const HINT_IDLE = 'Pick a button, then click around the area on the map. Click the first dot again to finish.';
-const HINT_DRAW = 'Click around the area. Click the first dot (or double-click) to finish. Esc cancels, Backspace undoes a point.';
+const HINT_ERASE = 'Click a shaded area to remove the whole thing (you will be asked to confirm).';
+const HINT_DRAW ='Click around the area. Click the first dot (or double-click) to finish. Esc cancels, Backspace undoes a point.';
 const outColor = () => out.mode === 'erase' ? '#ff6b6b' : `rgb(${zoneColor(S.zone)})`;
 const canClose = e => out.pts.length >= 3 && map.latLngToContainerPoint(out.pts[0]).distanceTo(e.containerPoint) < 18;
 
@@ -920,15 +937,16 @@ function drawDots() {
 function startOutline(mode) {
   if (!S.G) return;
   if (out.mode === mode) return cancelOutline();
-  out.mode = mode; out.pts = [];
+  out.mode = mode; out.pts = []; out.cut = false;
   armPick(false);
   document.body.classList.add('tool-poly'); map.doubleClickZoom.disable();
   $('oAdd').classList.toggle('on', mode === 'add'); $('oErase').classList.toggle('on', mode === 'erase'); $('oZone').classList.toggle('on', mode === 'assign');
-  $('editHint').textContent = HINT_DRAW;
+  $('editHint').textContent = mode === 'erase' ? HINT_ERASE : HINT_DRAW;
   drawDots(); drawOutline();
 }
 function cancelOutline() {
-  out.mode = null; out.pts = [];
+  out.mode = null; out.pts = []; out.cut = false; map.closePopup();
+  if (S.hilite) { S.hilite = null; render(); }
   document.body.classList.remove('tool-poly'); setTimeout(() => { if (!out.mode) map.doubleClickZoom.enable(); }, 400);
   ['oAdd', 'oErase', 'oZone'].forEach(id => $(id).classList.remove('on'));
   $('editHint').textContent = HINT_IDLE;
@@ -950,11 +968,39 @@ function finishOutline() {
   }
   cancelOutline();
 }
+// highlight the whole shape under the click and pop up a confirm button
+function askRemove(start, latlng) {
+  const g = S.G, m = S.mask, z = m[start], sel = new Uint8Array(m.length), stack = [start], shape = [];
+  sel[start] = 1;
+  while (stack.length) {
+    const i = stack.pop(), x = i % g.w; shape.push(i);
+    for (const j of [x > 0 ? i - 1 : -1, x < g.w - 1 ? i + 1 : -1, i - g.w, i + g.w]) if (j >= 0 && j < m.length && m[j] === z && !sel[j]) { sel[j] = 1; stack.push(j); }
+  }
+  S.hilite = sel; render();
+  const box = document.createElement('div'); box.className = 'ask';
+  const msg = document.createElement('div'); msg.textContent = `Remove this area? (${fmt(shape.length * pxAreaSqft())} sq ft)`;
+  const yes = document.createElement('button'); yes.textContent = 'Remove'; yes.className = 'danger';
+  const part = document.createElement('button'); part.textContent = 'Cut out part instead';
+  const no = document.createElement('button'); no.textContent = 'Cancel';
+  const row = document.createElement('div'); row.className = 'row'; row.append(yes, no);
+  box.append(msg, row, part);
+  const pop = L.popup({ closeButton: false, className: 'askPop', autoPan: true }).setLatLng(latlng).setContent(box).openOn(map);
+  let done = false;
+  yes.onclick = () => { done = true; pushUndo(); for (const i of shape) m[i] = 0; S.edited = true; S.hilite = null; map.closePopup(pop); cancelOutline(); render(); };
+  no.onclick = () => map.closePopup(pop);
+  part.onclick = () => { done = true; out.cut = true; S.hilite = null; map.closePopup(pop); render(); $('editHint').textContent = HINT_DRAW; };
+  pop.on('remove', () => { if (!done) { S.hilite = null; render(); } });
+}
 function armPick(on) { S.pickArmed = on; $('pick').classList.toggle('on', on); document.body.classList.toggle('tool-pick', on); if (on) { if (out.mode) cancelOutline(); status('Click a property on the map.'); } }
 
 map.on('click', async e => {
   if (S.pickArmed) { armPick(false); try { await loadParcelAt(e.latlng); } catch (err) { status(err.message, true); } return; }
   if (!out.mode) return;
+  // Remove area: clicking an existing shape selects the whole shape and asks before removing it
+  if (out.mode === 'erase' && !out.pts.length && !out.cut && S.mask) {
+    const [x, y] = toPx(e.latlng), g = S.G, i = Math.floor(y) * g.w + Math.floor(x);
+    if (x >= 0 && y >= 0 && x < g.w && y < g.h && S.mask[i]) return askRemove(i, e.latlng);
+  }
   if (canClose(e)) return finishOutline();
   const last = out.pts[out.pts.length - 1];
   if (last && map.latLngToContainerPoint(last).distanceTo(e.containerPoint) < 5) return;   // second click of a double-click
