@@ -59,7 +59,12 @@
   .hide { display:none !important; }
   .leaflet-container { font:inherit; }
   .lm-overlay { pointer-events:none; }
-  body.tool-brush #map, body.tool-poly #map, body.tool-pick #map { cursor:crosshair; }
+  body.tool-poly #map, body.tool-pick #map { cursor:crosshair; }
+  #mapWrap { flex:1; position:relative; display:flex; min-width:0; min-height:0; }
+  #busy { position:absolute; z-index:1500; top:16px; left:50%; transform:translateX(-50%); display:flex; align-items:center; gap:10px;
+    padding:10px 16px; border-radius:999px; background:#14181cee; border:1px solid var(--line); color:var(--text); font-weight:600; box-shadow:0 6px 20px #0008; white-space:nowrap; }
+  .spin { width:16px; height:16px; border-radius:50%; border:3px solid #ffffff33; border-top-color:var(--accent); animation:spin .8s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
   @media (max-width: 760px) { body { flex-direction:column-reverse; } #side { width:100%; height:48%; border-right:0; border-top:1px solid var(--line); } }
 </style>
 </head>
@@ -94,41 +99,20 @@
   <section id="zoneSec" class="hide">
     <h2>Yard zones</h2>
     <div id="zones"></div>
-    <div class="row gap">
-      <button id="zAdd">+ Add zone</button>
-      <button id="zSplit" title="Re-split the lawn into Front and Back using the street side of the house">Split front / back</button>
-    </div>
-    <div class="hint">Click a zone to work in it. Untick a zone to leave it out of the total. Double-click a name to rename.</div>
-  </section>
-
-  <section id="detSec" class="hide">
-    <h2>Auto-detect</h2>
-    <label class="sl"><span>Less grass</span><span>Sensitivity</span><span>More grass</span></label>
-    <input id="sens" type="range" min="0" max="100" value="50">
-    <label class="chk"><input id="clip" type="checkbox" checked> Stay inside the property line</label>
-    <div class="row gap"><button id="redo">Re-detect</button></div>
+    <div class="hint">Untick a zone to leave it out of the total. Click a zone to select it for the buttons below.</div>
   </section>
 
   <section id="editSec" class="hide">
-    <h2>Touch up</h2>
+    <h2>Fix the outline</h2>
     <div class="row">
-      <button id="tMove" class="on" title="V">Move</button>
-      <button id="tBrush" title="B">Brush</button>
-      <button id="tPoly" title="P">Outline</button>
+      <button id="oAdd" title="Outline an area to add as lawn">+ Add area</button>
+      <button id="oErase" title="Outline an area to remove">− Remove area</button>
     </div>
     <div class="row gap">
-      <button id="mAdd" class="on" title="Paint lawn into the active zone (X)">Add</button>
-      <button id="mErase" title="Remove lawn (X)">Erase</button>
-      <button id="mAssign" title="Move existing lawn into the active zone without adding any (X)">Re-zone</button>
-    </div>
-    <label class="sl"><span>Brush size</span><span id="bsz">6 ft</span></label>
-    <input id="brush" type="range" min="1" max="40" value="6">
-    <div class="row gap">
+      <button id="oZone" title="Outline part of the lawn to move it into the selected zone">Move area to zone</button>
       <button id="undo" title="Ctrl+Z">Undo</button>
-      <button id="clear">Clear all</button>
-      <button id="show" class="on">Overlay</button>
     </div>
-    <div class="hint">Brush: drag to paint. Outline: click corners, double-click to finish. Re-zone + Outline: loop around the back yard to make it its own zone.</div>
+    <div class="hint" id="editHint">Pick a button, then click around the area on the map. Click the first dot again to finish.</div>
   </section>
 
   <section>
@@ -140,7 +124,10 @@
     <div class="hint">Saved on this computer only. Imagery and parcels: NC OneMap, Wake County, USDA.</div>
   </section>
 </aside>
-<div id="map"></div>
+<div id="mapWrap">
+  <div id="map"></div>
+  <div id="busy" class="hide"><span class="spin"></span><span id="busyTxt">Working…</span></div>
+</div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
@@ -185,8 +172,7 @@ const S = {
   front: null,    // { hx, hy, ux, uy }: house centre and unit vector toward the street, in grid pixels
   inParcel: null, mask: null, undo: [],   // mask: 0 = not lawn, otherwise a zone id
   zones: [], zone: 1, edited: false,
-  tool: 'move', mode: 'add', show: true, pickArmed: false,
-  poly: [], drawing: false, last: null,
+  show: true, pickArmed: false,
 };
 const defaultZones = () => [{ id: 1, name: 'Front', on: true }, { id: 2, name: 'Back', on: true }];
 const zoneColor = id => ZCOL[(id - 1) % ZCOL.length];
@@ -214,11 +200,10 @@ const CanvasOverlay = L.ImageOverlay.extend({
 const ovCanvas = document.createElement('canvas');
 let overlay = null, ovCtx = null, ovImg = null;
 const parcelLine = L.polygon([], { color: '#ffd84a', weight: 2, fill: false, interactive: false }).addTo(map);
-const polyLine = L.polyline([], { color: '#fff', weight: 2, dashArray: '4 4', interactive: false }).addTo(map);
-const brushRing = L.circle([0, 0], { radius: 1, color: '#fff', weight: 1, fill: false, interactive: false });
 
 // ---------- helpers ----------
-function status(msg, err) { const s = $('status'); s.textContent = msg || ''; s.classList.toggle('err', !!err); }
+function status(msg, err) { const s = $('status'); s.textContent = msg || ''; s.classList.toggle('err', !!err); $('busy').classList.add('hide'); }
+function busy(msg) { status(msg); $('busyTxt').textContent = msg; $('busy').classList.remove('hide'); }   // status line + spinner over the map
 async function getJSON(url, timeoutMs = 30000) {
   const ctl = new AbortController(), timer = setTimeout(() => ctl.abort(), timeoutMs);
   try {
@@ -315,13 +300,15 @@ async function geocode(text, magicKey) {
 async function search(text, magicKey) {
   if (!text) return;
   searching = text; clearTimeout(suggTimer); hideSugg();
-  status('Finding address…');
+  busy('Finding address…');
   try {
     const hit = await geocode(text, magicKey);
     if (!hit) return status('Address not found. Try "123 Main St, City" or pick the property on the map.', true);
     await loadParcelAt(hit.ll, hit.label);
   } catch (e) { status(e.message, true); }
 }
+
+const DONE = 'Done. If the outline needs fixing, use the buttons below.';
 
 // ---------- parcel ----------
 function findParcel(ll) {   // ask the fast county service and the statewide one at once; first real answer wins
@@ -334,7 +321,7 @@ function findParcel(ll) {   // ask the fast county service and the statewide one
   return Promise.any([wake, state]).catch(() => null);
 }
 async function loadParcelAt(ll, label) {
-  status('Finding property line…');
+  busy('Finding property line…');
   map.setView(ll, Math.max(map.getZoom(), 19));
   const p = await findParcel(ll);
   if (!p) { armPick(true); return status('No property found at that spot. Click the property on the map.', true); }
@@ -344,7 +331,7 @@ async function loadParcelAt(ll, label) {
 }
 
 async function openParcel(parcel, saved) {
-  S.parcel = parcel; S.undo = []; S.poly = []; polyLine.setLatLngs([]);
+  S.parcel = parcel; S.undo = []; if (out.mode) cancelOutline();
   S.prob = S.imperv = S.front = S.bld = S.dark = S.shadeVeg = S.hard = S.summer = S.canopy = null; S.edited = false;
   S.zones = saved && saved.zones ? saved.zones.map(z => ({ id: z.id, name: z.name, on: z.on !== false })) : defaultZones();
   S.zone = S.zones[0].id;
@@ -389,10 +376,10 @@ async function openParcel(parcel, saved) {
   $('addr').textContent = parcel.label;
   const a = parcel.attrs || {};
   $('meta').textContent = [a.cntyname ? a.cntyname + ' County' : '', a.parno ? 'Parcel ' + a.parno : ''].filter(Boolean).join(' · ');
-  ['propSec', 'zoneSec', 'detSec', 'editSec'].forEach(id => $(id).classList.remove('hide'));
+  ['propSec', 'zoneSec', 'editSec'].forEach(id => $(id).classList.remove('hide'));
   buildZones(); render();
 
-  status('Loading aerial imagery…');
+  busy('Loading aerial photo…');
   S.rgb = S.cir = null;
   const g = S.G, m = 60 / cos, toGrid = p => [(p[0] - g.xmin) / g.res, (g.ymax - p[1]) / g.res];
   const env = d => `geometry=${g.xmin - d},${g.ymin - d},${g.xmax + d},${g.ymax + d}&geometryType=esriGeometryEnvelope&inSR=3857&spatialRel=esriSpatialRelIntersects&outSR=3857&returnGeometry=true&f=json`;
@@ -421,7 +408,7 @@ async function openParcel(parcel, saved) {
     if (!covered(rgb)) throw new Error('no aerial imagery covers this spot.');
     const useExtras = x => { S.cir = x[0]; S.summer = covered(x[1]) ? x[1] : null; };
     S.rgb = rgb; if (early) useExtras(early);
-    status('Finding the lawn…'); await sleep(0);
+    busy('Measuring the lawn…'); await sleep(30);
     classify();
     const [roads, bld] = await Promise.all([soon(roadsP), soon(bldP)]);
     if (S.parcel !== parcel) return;
@@ -430,15 +417,15 @@ async function openParcel(parcel, saved) {
     if (saved) status('Loaded saved measurement.');
     else {
       detect(); S.edited = false;
-      status(early ? 'Lawn detected. Touch up with the brush if needed.' : 'Lawn detected. Still checking shaded areas…');
+      if (early) status(DONE); else busy('Checking trees and shade…');
     }
     if (!early) extrasP.then(x => {   // infrared / summer photos arrived late: redo the shadow pass with them
       if (S.parcel !== parcel) return;
       useExtras(x);
-      if (!S.cir && !S.summer) return saved || status('Lawn detected (shadow photos unavailable, so shaded lawn may be missed).', true);
+      if (!S.summer) { if (!saved) status('Done, but the summer photo did not load, so woods and shade may be wrong. Try again in a minute.', true); if (!S.cir) return; }
       classify();
       if (!saved && !S.edited) { S.undo.pop(); detect(); S.edited = false; }
-      if (!saved) status('Lawn detected. Touch up with the brush if needed.');
+      if (!saved && S.summer) status(DONE);
     });
     if (roads === LATE || bld === LATE) Promise.all([roadsP, bldP]).then(([r, b]) => {   // street / building data arrived late
       if (S.parcel !== parcel) return;
@@ -716,12 +703,22 @@ function splitZones(m) {
     if (!m[i]) continue;
     m[i] = !f || (x - f.hx) * f.ux + (y - f.hy) * f.uy >= 0 ? zf : zb;
   }
+  if (!f || zf === zb) return;
+  // Only cut a patch in two where the cut is short (a side yard beside the house). A long cut straight across open
+  // lawn, or one that leaves a small sliver, is not a real front/back boundary: that patch stays in one zone.
+  const any = new Uint8Array(w * h); for (let i = 0; i < any.length; i++) any[i] = m[i] ? 1 : 0;
+  blobs(any, w, h, 1, (p, cnt) => {
+    let nf = 0, cut = 0;
+    for (const i of p) { if (m[i] === zf) nf++; if ((m[i + 1] && m[i + 1] !== m[i]) || (m[i + w] && m[i + w] !== m[i])) cut++; }
+    const minor = Math.min(nf, cnt - nf);
+    if (minor && (minor < cnt * 0.12 || cut > 0.9 * Math.sqrt(cnt))) { const z = nf >= cnt - nf ? zf : zb; for (const i of p) m[i] = z; }
+  });
 }
 function detect() {
   if (!S.prob) return;
   pushUndo();
-  const { w, h, ppf } = S.G, n = w * h, clip = $('clip').checked;
-  const thr = 0.78 - 0.56 * (+$('sens').value / 100);   // slider midpoint = 50% probability
+  const { w, h, ppf } = S.G, n = w * h, clip = true;   // lawn always stops at the property line
+  const thr = 0.5;
   let m = new Uint8Array(n);
   // never lawn: outside the lot (if clipping), a mapped building, or a detected hard surface (roof, driveway, street, patio)
   const bld = S.bld, hard = S.hard, ok = i => (!clip || S.inParcel[i]) && !(bld && bld[i]) && !(hard && hard[i]);
@@ -744,9 +741,31 @@ function detect() {
     }
     for (let i = 0; i < n; i++) if (m[i] === 2) m[i] = 1;
   };
+  // 0. one lot, one kind of turf: take the colour of the biggest confident patch and treat ground of a clearly
+  //    different colour (straw, bare soil or mulch that resembles dormant grass) as not lawn - unless that other-coloured
+  //    area is itself big enough to be a second lawn of a different grass. Shadowed pixels are judged later.
+  const rgb = S.rgb, turf = new Uint8Array(n).fill(1);
+  {
+    let dom = null; blobs(m, w, h, 1, (p, cnt) => { if (!dom || cnt > dom.length) dom = p; });
+    if (dom && dom.length * px > 400) {
+      let sr = 0, sg = 0, sb = 0, c = 0;
+      for (let k = 0; k < dom.length; k += 3) { const i = dom[k]; if (S.dark[i]) continue; sr += rgb[i * 4]; sg += rgb[i * 4 + 1]; sb += rgb[i * 4 + 2]; c++; }
+      if (c > 50) {
+        sr /= c * 255; sg /= c * 255; sb /= c * 255;
+        const ch = k => { const a = new Float32Array(n); for (let i = 0; i < n; i++) a[i] = rgb[i * 4 + k] / 255; return boxMean(a, w, h, Math.max(1, Math.round(1.5 * ppf))); };
+        const R = ch(0), G = ch(1), B = ch(2), other = new Uint8Array(n);
+        for (let i = 0; i < n; i++) {
+          turf[i] = S.dark[i] || Math.abs(R[i] - sr) + Math.abs(G[i] - sg) + Math.abs(B[i] - sb) < 0.4 ? 1 : 0;   // loose on purpose: front and back yards differ in tone; straw is far off
+          other[i] = m[i] && !turf[i] ? 1 : 0;
+        }
+        blobs(other, w, h, 1, (p, cnt) => { if (cnt >= dom.length * 0.3) for (const i of p) turf[i] = 1; });
+        for (let i = 0; i < n; i++) if (m[i] && !turf[i]) m[i] = 0;
+      }
+    }
+  }
   // 1. thin or patchy turf next to confident lawn counts too (this is what keeps the fill from being blotchy)
   const weak = thr * 0.45, P = S.prob;
-  grow(j => P[j] > weak && open(j), Math.round(30 * ppf), 60);
+  grow(j => P[j] > weak && open(j) && turf[j], Math.round(30 * ppf), 60);
   // 2. bridge thin shadows (bare branches, fences) that cut across a lawn: close gaps up to ~8 ft wide through dark pixels
   const rb = Math.max(2, Math.round(4 * ppf)), closed = morph(morph(m, w, h, rb, true), w, h, rb, false);
   for (let i = 0; i < n; i++) if (!m[i] && closed[i] && S.dark[i] && ok(i) && !woods(i)) m[i] = 1;
@@ -771,13 +790,13 @@ function detect() {
   //    drive that is only a little lighter than the lawn from being swallowed.
   const ok2 = i => (!clip || S.inParcel[i]) && !(bld && bld[i]);
   {
-    const rgb = S.rgb, r5 = Math.max(3, Math.round(5 * ppf));
+    const r5 = Math.max(3, Math.round(5 * ppf));
     const mf = new Float32Array(n), cr = new Float32Array(n), cg = new Float32Array(n), cb = new Float32Array(n);
     for (let i = 0, j = 0; i < n; i++, j += 4) if (m[i]) { mf[i] = 1; cr[i] = rgb[j] / 255; cg[i] = rgb[j + 1] / 255; cb[i] = rgb[j + 2] / 255; }
     const bm = boxMean(mf, w, h, r5), br = boxMean(cr, w, h, r5), bg = boxMean(cg, w, h, r5), bb = boxMean(cb, w, h, r5);
     const like = new Uint8Array(n);
     for (let i = 0, j = 0; i < n; i++, j += 4) {
-      if (m[i] || bm[i] < 0.06 || !ok2(i) || woods(i)) continue;
+      if (m[i] || bm[i] < 0.06 || !ok2(i) || woods(i) || !turf[i]) continue;
       const d = Math.abs(rgb[j] / 255 - br[i] / bm[i]) + Math.abs(rgb[j + 1] / 255 - bg[i] / bm[i]) + Math.abs(rgb[j + 2] / 255 - bb[i] / bm[i]);
       if (d < (hard && hard[i] ? 0.07 : 0.15)) like[i] = 1;
     }
@@ -789,12 +808,29 @@ function detect() {
       if (hd < cnt * 0.5) for (const i of p) if (ok2(i)) m[i] = 1;
     });
   }
-  // 6. straighten: turn the ragged pixel outline into clean polygons with straight sides
-  m = straighten(m, w, h, 1.1 * ppf);
+  // 6. simplify: a few clean shapes, not blotches. The amount of smoothing scales with the lawn (about 1.5 ft on a
+  //    small yard, up to 6 ft on an acre): fill inlets, shave spurs, fill holes that are not a building or pavement,
+  //    drop patches that are small next to the main lawn, then redraw the outline with straight sides.
+  let biggest = 0; blobs(m, w, h, 1, (p, cnt) => { if (cnt > biggest) biggest = cnt; });
+  const smooth = Math.max(1.5, Math.min(6, Math.sqrt(biggest * px) * 0.02)), rc = Math.max(2, Math.round(smooth * ppf)), ro = Math.max(1, Math.round(smooth * 0.6 * ppf));
+  const filled = morph(morph(m, w, h, rc, true), w, h, rc, false);
+  for (let i = 0; i < n; i++) if (!m[i] && filled[i] && ok(i)) m[i] = 1;
+  m = morph(morph(m, w, h, ro, false), w, h, ro, true);
+  blobs(m, w, h, 0, (p, cnt, border) => {
+    if (border || cnt * px > 3000) return;
+    let blocked = 0; for (const i of p) if (!ok(i)) blocked++;
+    if (blocked < cnt * 0.3) for (const i of p) if (ok2(i)) m[i] = 1;
+  });
+  biggest = 0; blobs(m, w, h, 1, (p, cnt) => { if (cnt > biggest) biggest = cnt; });
+  blobs(m, w, h, 1, (p, cnt) => {
+    let conf = 0; for (let k = 0; k < p.length; k += 4) conf += P[p[k]];
+    // drop patches that are small next to the main lawn, or that were built almost entirely out of shadow and weak
+    // evidence (the fringe of the woods) rather than ground the model actually recognised as turf
+    if (cnt < biggest * 0.05 || cnt * px < 200 || conf / Math.ceil(p.length / 4) < 0.55) for (const i of p) m[i] = 0;
+  });
+  m = straighten(m, w, h, Math.min(3, smooth) * ppf);
   for (let i = 0; i < n; i++) if (m[i] && !ok2(i)) m[i] = 0;
-  // on big lots, drop stray patches that are tiny next to the real lawn (specks out in the woods)
-  let total = 0; for (let i = 0; i < n; i++) total += m[i];
-  blobs(m, w, h, 1, (p, cnt) => { if (cnt < total * 0.006 || cnt * px < 120) for (const i of p) m[i] = 0; });
+  blobs(m, w, h, 1, (p, cnt) => { if (cnt * px < 200) for (const i of p) m[i] = 0; });   // crumbs left by the redraw
   splitZones(m);
   S.mask = m;
   render();
@@ -813,22 +849,12 @@ function buildZones() {
     nm.ondblclick = e => { e.stopPropagation(); const v = prompt('Zone name', z.name); if (v && v.trim()) { z.name = v.trim().slice(0, 24); buildZones(); render(); } };
     const ar = document.createElement('span'); ar.className = 'za'; ar.id = 'za' + z.id; if (z.sqft != null) ar.textContent = fmt(z.sqft) + ' sq ft';
     row.append(cb, sw, nm, ar);
-    row.onclick = () => { S.zone = z.id; buildZones(); setMode(S.mode); };
+    row.onclick = () => { S.zone = z.id; buildZones(); if (out.mode) { drawDots(); drawOutline(); } };
     box.appendChild(row);
   });
-  $('zSplit').disabled = !S.front;
+  const act = S.zones.find(z => z.id === S.zone);
+  $('oZone').textContent = 'Move area to ' + (act ? act.name : 'zone');
 }
-$('zAdd').onclick = () => {
-  const names = ['Side', 'Front 2', 'Back 2', 'Other'], used = new Set(S.zones.map(z => z.name));
-  const v = prompt('Name for the new zone', names.find(nm => !used.has(nm)) || 'Zone ' + (S.zones.length + 1));
-  if (!v || !v.trim()) return;
-  const id = Math.max(...S.zones.map(z => z.id)) + 1;
-  if (id > 12) return status('That is the most zones one property can have.', true);
-  S.zones.push({ id, name: v.trim().slice(0, 24), on: true }); S.zone = id;
-  buildZones(); setMode('assign'); render();
-  status('New zone ready. Use Brush or Outline to move lawn into it.');
-};
-$('zSplit').onclick = () => { if (!S.front || !S.mask) return; pushUndo(); splitZones(S.mask); S.edited = true; render(); };
 
 // ---------- render + stats ----------
 let rafPending = false;
@@ -862,87 +888,97 @@ function draw() {
   $('sub').textContent = `${(total / 1000).toFixed(1)} K` + (total < all - 0.5 ? `  ·  all zones ${fmt(all)}` : '') + `  ·  lot ${fmt(S.lot)} sq ft (${(S.lot / 43560).toFixed(2)} ac)`;
 }
 
-// ---------- editing ----------
+// ---------- editing: one outline tool ----------
+// "Add area", "Remove area" and "Move area to zone" all work the same way: click around the area, then click the
+// first dot again (or double-click, or press Enter) to finish. Dragging still pans the map while outlining.
 function pushUndo() { if (!S.mask) return; S.undo.push(S.mask.slice()); if (S.undo.length > 30) S.undo.shift(); }
-function undo() { const m = S.undo.pop(); if (m && m.length === S.mask.length) { S.mask = m; render(); } }
-const applyAt = i => { if (S.mode === 'add') S.mask[i] = S.zone; else if (S.mode === 'erase') S.mask[i] = 0; else if (S.mask[i]) S.mask[i] = S.zone; };
-function paint(x0, y0, x1, y1) {
-  const g = S.G, r = Math.max(0.6, (+$('brush').value / 2) * g.ppf);
-  const steps = Math.max(1, Math.ceil(Math.hypot(x1 - x0, y1 - y0) / Math.max(1, r / 2)));
-  for (let s = 0; s <= steps; s++) {
-    const cx = x0 + (x1 - x0) * s / steps, cy = y0 + (y1 - y0) * s / steps;
-    const ya = Math.max(0, Math.floor(cy - r)), yb = Math.min(g.h - 1, Math.ceil(cy + r));
-    const xa = Math.max(0, Math.floor(cx - r)), xb = Math.min(g.w - 1, Math.ceil(cx + r));
-    for (let y = ya; y <= yb; y++) for (let x = xa; x <= xb; x++)
-      if ((x + 0.5 - cx) ** 2 + (y + 0.5 - cy) ** 2 <= r * r) applyAt(y * g.w + x);
-  }
-  S.edited = true; render();
+function undo() { const m = S.undo.pop(); if (m && m.length === S.mask.length) { S.mask = m; S.edited = true; render(); } }
+
+const out = { mode: null, pts: [], firstDot: null };   // the outline being drawn
+const outFill = L.polygon([], { weight: 2, fillOpacity: 0.2, interactive: false }).addTo(map);
+const outBand = L.polyline([], { weight: 2, dashArray: '6 6', interactive: false }).addTo(map);
+const outDots = L.layerGroup().addTo(map);
+const HINT_IDLE = 'Pick a button, then click around the area on the map. Click the first dot again to finish.';
+const HINT_DRAW = 'Click around the area. Click the first dot (or double-click) to finish. Esc cancels, Backspace undoes a point.';
+const outColor = () => out.mode === 'erase' ? '#ff6b6b' : `rgb(${zoneColor(S.zone)})`;
+const canClose = e => out.pts.length >= 3 && map.latLngToContainerPoint(out.pts[0]).distanceTo(e.containerPoint) < 18;
+
+function drawOutline(cursor) {   // cursor: where the mouse is, for the rubber-band line
+  const col = outColor(), pts = out.pts;
+  outFill.setStyle({ color: col, fillColor: col }); outBand.setStyle({ color: col });
+  outFill.setLatLngs(pts.length >= 3 ? pts : []);
+  outBand.setLatLngs(!pts.length ? [] : pts.length < 3 ? (cursor ? [...pts, cursor] : pts) : cursor ? [pts[pts.length - 1], cursor, pts[0]] : []);
 }
-function finishPoly() {
-  if (S.poly.length >= 3) {
+function drawDots() {
+  outDots.clearLayers(); out.firstDot = null;
+  const col = outColor();
+  out.pts.forEach((ll, i) => {
+    const dot = L.circleMarker(ll, { radius: i ? 4 : 8, color: '#fff', weight: 2, fillColor: col, fillOpacity: 1, interactive: false }).addTo(outDots);
+    if (!i) out.firstDot = dot;
+  });
+}
+function startOutline(mode) {
+  if (!S.G) return;
+  if (out.mode === mode) return cancelOutline();
+  out.mode = mode; out.pts = [];
+  armPick(false);
+  document.body.classList.add('tool-poly'); map.doubleClickZoom.disable();
+  $('oAdd').classList.toggle('on', mode === 'add'); $('oErase').classList.toggle('on', mode === 'erase'); $('oZone').classList.toggle('on', mode === 'assign');
+  $('editHint').textContent = HINT_DRAW;
+  drawDots(); drawOutline();
+}
+function cancelOutline() {
+  out.mode = null; out.pts = [];
+  document.body.classList.remove('tool-poly'); setTimeout(() => { if (!out.mode) map.doubleClickZoom.enable(); }, 400);
+  ['oAdd', 'oErase', 'oZone'].forEach(id => $(id).classList.remove('on'));
+  $('editHint').textContent = HINT_IDLE;
+  drawDots(); drawOutline();
+}
+function finishOutline() {
+  const pts = out.pts, mode = out.mode;
+  if (pts.length >= 3 && S.mask) {
     pushUndo();
     const g = S.G, c = document.createElement('canvas'); c.width = g.w; c.height = g.h;
     const x = c.getContext('2d'); x.beginPath();
-    S.poly.forEach((ll, i) => { const p = toPx(ll); i ? x.lineTo(p[0], p[1]) : x.moveTo(p[0], p[1]); });
+    pts.forEach((ll, i) => { const p = toPx(ll); i ? x.lineTo(p[0], p[1]) : x.moveTo(p[0], p[1]); });
     x.closePath(); x.fill();
-    const d = x.getImageData(0, 0, g.w, g.h).data;
-    for (let i = 0; i < g.w * g.h; i++) if (d[i * 4 + 3] > 127) applyAt(i);
+    const d = x.getImageData(0, 0, g.w, g.h).data, m = S.mask, z = S.zone;
+    for (let i = 0; i < g.w * g.h; i++) if (d[i * 4 + 3] > 127) {
+      if (mode === 'add') m[i] = z; else if (mode === 'erase') m[i] = 0; else if (m[i]) m[i] = z;   // 'assign' only re-labels existing lawn
+    }
     S.edited = true; render();
   }
-  S.poly = []; polyLine.setLatLngs([]);
+  cancelOutline();
 }
-function setTool(t) {
-  if (S.tool === 'poly' && t !== 'poly') { S.poly = []; polyLine.setLatLngs([]); }
-  S.tool = t;
-  document.body.classList.toggle('tool-brush', t === 'brush');
-  document.body.classList.toggle('tool-poly', t === 'poly');
-  $('tMove').classList.toggle('on', t === 'move'); $('tBrush').classList.toggle('on', t === 'brush'); $('tPoly').classList.toggle('on', t === 'poly');
-  if (t === 'move') { map.dragging.enable(); map.doubleClickZoom.enable(); } else { map.dragging.disable(); map.doubleClickZoom.disable(); }
-  if (t === 'brush') brushRing.addTo(map); else brushRing.remove();
-}
-function setMode(md) {
-  S.mode = md;
-  $('mAdd').classList.toggle('on', md === 'add'); $('mErase').classList.toggle('on', md === 'erase'); $('mAssign').classList.toggle('on', md === 'assign');
-  brushRing.setStyle({ color: md === 'erase' ? '#ff6b6b' : `rgb(${zoneColor(S.zone)})` });
-}
-function armPick(on) { S.pickArmed = on; $('pick').classList.toggle('on', on); document.body.classList.toggle('tool-pick', on); if (on) status('Click a property on the map.'); }
+function armPick(on) { S.pickArmed = on; $('pick').classList.toggle('on', on); document.body.classList.toggle('tool-pick', on); if (on) { if (out.mode) cancelOutline(); status('Click a property on the map.'); } }
 
-map.on('mousedown', e => {
-  if (S.pickArmed || S.tool !== 'brush' || !S.G || e.originalEvent.button !== 0) return;
-  pushUndo(); S.drawing = true; S.last = toPx(e.latlng); paint(S.last[0], S.last[1], S.last[0], S.last[1]);
-});
-map.on('mousemove', e => {
-  if (S.tool === 'brush') { brushRing.setLatLng(e.latlng); brushRing.setRadius(+$('brush').value / 2 * FT); }
-  if (S.drawing) { const p = toPx(e.latlng); paint(S.last[0], S.last[1], p[0], p[1]); S.last = p; }
-  if (S.tool === 'poly' && S.poly.length) polyLine.setLatLngs([...S.poly, e.latlng]);
-});
-window.addEventListener('mouseup', () => { S.drawing = false; });
 map.on('click', async e => {
   if (S.pickArmed) { armPick(false); try { await loadParcelAt(e.latlng); } catch (err) { status(err.message, true); } return; }
-  if (S.tool === 'poly' && S.G) { S.poly.push(e.latlng); polyLine.setLatLngs(S.poly); }
+  if (!out.mode) return;
+  if (canClose(e)) return finishOutline();
+  const last = out.pts[out.pts.length - 1];
+  if (last && map.latLngToContainerPoint(last).distanceTo(e.containerPoint) < 5) return;   // second click of a double-click
+  out.pts.push(e.latlng); drawDots(); drawOutline(e.latlng);
 });
-map.on('dblclick', () => { if (S.tool === 'poly') { S.poly.pop(); finishPoly(); } });
+map.on('dblclick', () => { if (out.mode) finishOutline(); });
+map.on('mousemove', e => {
+  if (!out.mode) return;
+  drawOutline(e.latlng);
+  if (out.firstDot) out.firstDot.setStyle({ radius: canClose(e) ? 12 : 8, fillColor: canClose(e) ? '#fff' : outColor() });
+});
 
-$('tMove').onclick = () => setTool('move'); $('tBrush').onclick = () => setTool('brush'); $('tPoly').onclick = () => setTool('poly');
-$('mAdd').onclick = () => setMode('add'); $('mErase').onclick = () => setMode('erase'); $('mAssign').onclick = () => setMode('assign');
-$('brush').oninput = () => { $('bsz').textContent = $('brush').value + ' ft'; };
+$('oAdd').onclick = () => startOutline('add'); $('oErase').onclick = () => startOutline('erase'); $('oZone').onclick = () => startOutline('assign');
 $('undo').onclick = undo;
-$('clear').onclick = () => { pushUndo(); S.mask.fill(0); S.edited = true; render(); };
-$('show').onclick = () => { S.show = !S.show; $('show').classList.toggle('on', S.show); render(); };
-$('redo').onclick = detect; $('sens').onchange = detect; $('clip').onchange = detect;
 $('pick').onclick = () => armPick(!S.pickArmed);
 $('lines').onclick = () => { const on = !map.hasLayer(linesLayer); on ? linesLayer.addTo(map) : linesLayer.remove(); $('lines').classList.toggle('on', on); if (on && map.getZoom() < 16) status('Zoom in to see property lines.'); };
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT' && e.target.type === 'text') return;
-  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); return undo(); }
-  if (!S.G || e.ctrlKey || e.metaKey || e.altKey) return;
   const k = e.key.toLowerCase();
-  if (k === 'v') setTool('move'); else if (k === 'b') setTool('brush'); else if (k === 'p') setTool('poly');
-  else if (k === 'x') setMode({ add: 'erase', erase: 'assign', assign: 'add' }[S.mode]);
-  else if (k === 'enter' && S.tool === 'poly') finishPoly();
-  else if (k === 'escape') { S.poly = []; polyLine.setLatLngs([]); armPick(false); }
-  else if (k === '[' || k === ']') { const b = $('brush'); b.value = +b.value + (k === ']' ? 2 : -2); b.oninput(); }
-  else if (k >= '1' && k <= '9' && S.zones[+k - 1]) { S.zone = S.zones[+k - 1].id; buildZones(); setMode(S.mode); }
+  if ((e.ctrlKey || e.metaKey) && k === 'z') { e.preventDefault(); if (out.mode && out.pts.length) { out.pts.pop(); drawDots(); drawOutline(); } else undo(); return; }
+  if (!S.G || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (k === 'enter' && out.mode) finishOutline();
+  else if (k === 'escape') { if (out.mode) cancelOutline(); armPick(false); }
+  else if ((k === 'backspace' || k === 'delete') && out.mode && out.pts.length) { e.preventDefault(); out.pts.pop(); drawDots(); drawOutline(); }
 });
 
 // ---------- save / load / export ----------
