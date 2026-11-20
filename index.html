@@ -140,6 +140,9 @@
 'use strict';
 const SVC = 'https://services.nconemap.gov/secure/rest/services';
 const GEOCODE = SVC + '/AddressNC/AddressNC_geocoder/GeocodeServer';
+const WORLD_GEOCODE = 'https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer';   // Esri's address search: fast, rooftop points
+const GEOCODERS = [WORLD_GEOCODE, GEOCODE];
+const NC_ONLY = '&countryCode=USA&searchExtent=-84.4,33.7,-75.3,36.7';   // keep the worldwide service to North Carolina
 const PARCELS = SVC + '/NC1Map_Parcels/FeatureServer/1';
 const PARCEL_MAP = SVC + '/NC1Map_Parcels/MapServer';
 const WAKE_PARCELS = 'https://maps.wakegov.com/arcgis/rest/services/Property/Parcels/MapServer/0';   // much faster than the state service, Wake County only
@@ -153,7 +156,8 @@ const ORTHO = SVC + '/Imagery/Orthoimagery_Latest/ImageServer';
 // infrared sources, tried in order (the newest flights don't have an infrared band published in every county);
 // each returns an image whose channels are [near-infrared, red, green]
 const INFRARED = [[SVC + '/Imagery/Orthoimagery_Latest_CIR/ImageServer', ''], [SVC + '/Imagery/Orthoimagery_2020_2023_4band_analysis/ImageServer', '3,0,1']];
-const NAIP = 'https://imagery.nationalmap.gov/arcgis/rest/services/USGSNAIPImagery/ImageServer';   // USDA summer photo: [near-infrared, red, green]
+// USDA summer photo (leaf-on), read as [near-infrared, red, green]; two mirrors of the same imagery
+const NAIP = ['https://imagery.nationalmap.gov/arcgis/rest/services/USGSNAIPPlus/ImageServer', 'https://imagery.nationalmap.gov/arcgis/rest/services/USGSNAIPImagery/ImageServer'];
 const SQFT_PER_M2 = 10.7639104;
 const FT = 0.3048;
 const PAD_FT = 25;          // imagery margin around the parcel
@@ -266,9 +270,11 @@ $('q').addEventListener('input', () => {
   if (text.length < 4) return hideSugg();
   suggTimer = setTimeout(async () => {
     try {
-      const j = await getJSON(`${GEOCODE}/suggest?text=${enc(text)}&maxSuggestions=6&f=json`, 8000);
+      // two address services are asked at once (the state one is rooftop-accurate but often very slow); first answer wins
+      const list = await Promise.any(GEOCODERS.map(svc => getJSON(`${svc}/suggest?text=${enc(text)}&maxSuggestions=6${svc === GEOCODE ? '' : NC_ONLY}&f=json`, 15000)
+        .then(j => { const s = (j.suggestions || []).filter(x => !x.isCollection); if (!s.length) throw new Error('none'); return s.map(x => ({ text: x.text, magicKey: x.magicKey, svc })); })));
       if ($('q').value.trim() !== text || searching === text) return;
-      suggItems = j.suggestions || []; suggIdx = -1;
+      suggItems = list; suggIdx = -1;
       const ul = $('sugg'); ul.innerHTML = '';
       suggItems.forEach((s, i) => { const li = document.createElement('li'); li.textContent = s.text; li.onmousedown = e => { e.preventDefault(); chooseSugg(i); }; ul.appendChild(li); });
       ul.classList.toggle('hide', !suggItems.length);
@@ -288,27 +294,27 @@ $('q').addEventListener('keydown', e => {
 });
 $('q').addEventListener('blur', () => setTimeout(hideSugg, 150));
 function hideSugg() { $('sugg').classList.add('hide'); suggItems = []; suggIdx = -1; }
-function chooseSugg(i) { const s = suggItems[i]; $('q').value = s.text; hideSugg(); search(s.text, s.magicKey); }
+function chooseSugg(i) { const s = suggItems[i]; $('q').value = s.text; hideSugg(); search(s.text, s.magicKey, s.svc); }
 let searching = '';   // text of the search in flight, so suggestions that arrive after Enter don't pop back up
 
-async function geocode(text, magicKey) {
-  try {   // state address points first (rooftop-accurate) ...
-    const j = await getJSON(`${GEOCODE}/findAddressCandidates?SingleLine=${enc(text)}${magicKey ? '&magicKey=' + enc(magicKey) : ''}&outSR=4326&maxLocations=1&f=json`, 10000);
-    const c = (j.candidates || [])[0];
-    if (c) return { ll: L.latLng(c.location.y, c.location.x), label: c.address };
-  } catch (e) { /* fall through to the backup */ }
+async function geocode(text, magicKey, from) {
+  // Ask both address services at once and take the first solid match (a suggestion's key only works on its own service).
+  const ask = svc => getJSON(`${svc}/findAddressCandidates?SingleLine=${enc(text)}${magicKey && svc === from ? '&magicKey=' + enc(magicKey) : ''}` +
+    `&outSR=4326&maxLocations=1${svc === GEOCODE ? '' : NC_ONLY}&f=json`, 30000)
+    .then(j => { const c = (j.candidates || [])[0]; if (!c || c.score < 85) throw new Error('none'); return { ll: L.latLng(c.location.y, c.location.x), label: c.address.toUpperCase() }; });
+  try { return await Promise.any(GEOCODERS.map(ask)); } catch (e) { /* fall through to the last-resort backup */ }
   try {   // ... then OpenStreetMap as a backup when the state geocoder is slow or has no match
     const j = await getJSON(`${NOMINATIM}?q=${enc(/\bNC\b|north carolina/i.test(text) ? text : text + ', NC')}&format=jsonv2&limit=1&countrycodes=us`, 10000);
     if (j && j[0]) return { ll: L.latLng(+j[0].lat, +j[0].lon), label: text.toUpperCase() };
   } catch (e) { /* no match */ }
   return null;
 }
-async function search(text, magicKey) {
+async function search(text, magicKey, from) {
   if (!text) return;
   searching = text; clearTimeout(suggTimer); hideSugg();
   busy('Finding address…');
   try {
-    const hit = await geocode(text, magicKey);
+    const hit = await geocode(text, magicKey, from);
     if (!hit) return status('Address not found. Try "123 Main St, City" or pick the property on the map.', true);
     await loadParcelAt(hit.ll, hit.label);
   } catch (e) { status(e.message, true); }
@@ -407,13 +413,18 @@ async function openParcel(parcel, saved) {
   const LATE = {}, soon = p => Promise.race([p, sleep(2500).then(() => LATE)]);
   try {
     // the colour photo does the detecting; the infrared and summer photos are only used to see into shadows, so don't wait long for them
-    const cirP = fetchInfrared().catch(() => null), sumP = fetchPixels(NAIP, '3,0,1', 20000, 2).catch(() => null);
+    // (the summer photo is served from two federal mirrors; one of them is often very slow, so ask both and take the first good answer)
+    const summerFrom = svc => fetchPixels(svc, '3,0,1', 30000, 2).then(px => { if (!covered(px)) throw new Error('empty'); return px; });
+    const cirP = fetchInfrared().catch(() => null), sumP = Promise.any(NAIP.map(summerFrom)).catch(() => null);
     const rgb = await fetchPixels(ORTHO, '');
-    const extrasP = Promise.all([cirP, sumP]), early = await Promise.race([extrasP, sleep(4000).then(() => null)]);
     if (S.parcel !== parcel) return;
     if (!covered(rgb)) throw new Error('no aerial imagery covers this spot.');
-    const useExtras = x => { S.cir = x[0]; S.summer = covered(x[1]) ? x[1] : null; };
-    S.rgb = rgb; if (early) useExtras(early);
+    // Nothing is shown until the summer photo is in (or has clearly failed): a first guess without it marks woods
+    // and bare ground as lawn, and a wrong picture that later corrects itself is worse than a few more seconds.
+    busy('Loading summer photo…');
+    const [cir, summer] = await Promise.all([Promise.race([cirP, sleep(10000).then(() => null)]), Promise.race([sumP, sleep(45000).then(() => null)])]);
+    if (S.parcel !== parcel) return;
+    S.rgb = rgb; S.cir = cir; S.summer = summer;
     busy('Measuring the lawn…'); await sleep(30);
     classify();
     const [roads, bld] = await Promise.all([soon(roadsP), soon(bldP)]);
@@ -423,16 +434,9 @@ async function openParcel(parcel, saved) {
     if (saved) status('Loaded saved measurement.');
     else {
       detect(); S.edited = false;
-      if (early) status(DONE); else busy('Checking trees and shade…');
+      if (S.summer) status(DONE);
+      else status('Done, but the summer photo would not load, so woods, dirt drives and bare ground may be marked. Search again in a minute.', true);
     }
-    if (!early) extrasP.then(x => {   // infrared / summer photos arrived late: redo the shadow pass with them
-      if (S.parcel !== parcel) return;
-      useExtras(x);
-      if (!S.summer) { if (!saved) status('Done, but the summer photo did not load, so woods and shade may be wrong. Try again in a minute.', true); if (!S.cir) return; }
-      classify();
-      if (!saved && !S.edited) { S.undo.pop(); detect(); S.edited = false; }
-      if (!saved && S.summer) status(DONE);
-    });
     if (roads === LATE || bld === LATE) Promise.all([roadsP, bldP]).then(([r, b]) => {   // street / building data arrived late
       if (S.parcel !== parcel) return;
       apply(r, b);
@@ -587,6 +591,7 @@ function nirGain(px, gray, n) {
   const ratio = q.length >= 300 ? pick(q, 0.3) : all.length ? pick(all, 0.08) : 1;   // few grey pixels: use the least-vegetated ones
   return Math.max(0.5, Math.min(2.5, 1 / (ratio || 1)));
 }
+let CORE = 0.92, TREE = 40, LIVE = 0.10, CONF = 0.55, STALE = 0.75, SURE = 0.84;   // test knobs: how solid canopy must be to count as woods; how far (ft) lawn runs under trees; winter infrared greenness of living turf
 function computeFeatures() {
   const { w, h, ppf } = S.G, n = w * h, rgb = S.rgb, cir = S.cir;
   const r1 = Math.max(1, Math.round(1.5 * ppf)), r3 = Math.max(2, Math.round(3 * ppf)), r8 = Math.max(4, Math.round(8 * ppf));
@@ -622,10 +627,20 @@ function computeFeatures() {
     ndS = mk(); canopy = new Uint8Array(n);
     for (let i = 0; i < n; i++) {
       const nd = (Nb[i] - Rb[i]) / (Nb[i] + Rb[i] + 1e-6); ndS[i] = nd;
-      // canopy is green AND rough. (Darkness alone is not enough: a tree line's shadow lying on the lawn is dark too,
-      // but smooth, and must not be mistaken for trees.)  turf roughness <= ~0.024, canopy >= ~0.030
-      canopy[i] = nd > 0.34 && rough[i] > 0.026 ? 1 : 0;
+      // Canopy is very green and either rough, or dark in red light while still bright in infrared (dense leaves).
+      // A tree line's shadow lying on the lawn is dark in BOTH, and smooth, so it is not mistaken for trees.
+      // turf: red >= ~0.32, roughness <= ~0.024;  canopy: red <= ~0.28, infrared >= ~0.5, roughness >= ~0.030
+      // measured around Wake/Granville: turf greenness 0.18-0.42, trees 0.44-0.66 (sunlit woods edges are the low end)
+      canopy[i] = (nd > 0.34 && rough[i] > 0.026) || (Nb[i] > 0.45 && (nd > 0.43 || (nd > 0.34 && Rb[i] < 0.30))) ? 1 : 0;
     }
+    // woods are solid: close the sunlit gaps between crowns (up to ~16 ft across) so they are not read as clearings
+    const rg = Math.max(4, Math.round(8 * ppf)); canopy = morph(morph(canopy, w, h, rg, true), w, h, rg, false);
+    // Woods (1) or trees standing in a yard (3)? Woods are deep: somewhere inside there is an 80 ft square that is
+    // all canopy. Canopy within 40 ft of such a spot is woods; the rest is yard trees, and lawn can run underneath them.
+    const rw = Math.max(6, Math.round(40 * ppf)), dens = boxMean(Float32Array.from(canopy), w, h, rw), core = mk();
+    for (let i = 0; i < n; i++) core[i] = canopy[i] && dens[i] > CORE ? 1 : 0;
+    const nearCore = boxMean(core, w, h, rw);
+    for (let i = 0; i < n; i++) if (canopy[i] && nearCore[i] < 1e-5) canopy[i] = 3;
   }
   return { X, nd3, nir3, ndS, canopy };
 }
@@ -647,8 +662,8 @@ function predict(X, n, model) {
 function classify() {
   const { w, h, ppf } = S.G, n = w * h;
   const { X, nd3: nd, nir3, ndS, canopy } = computeFeatures();
-  if (LM.keep) { S.X = X; S.nd3 = nd; S.nir3 = nir3; S.ndS = ndS; }
-  S.canopy = canopy;
+  if (LM.keep) { S.X = X; S.nd3 = nd; S.nir3 = nir3; }
+  S.canopy = canopy; S.ndS = ndS; S.ndW = nd;
   // Two colour/texture models: how likely each pixel is lawn, and how likely it is a hard surface (roof, driveway,
   // street, patio). In testing on unseen lots, colour did as well as models that also used infrared, and it always
   // matches the newest photo.
@@ -661,17 +676,33 @@ function classify() {
   // "dark" = shadow-dark pixels. "shadeVeg" = dark pixels that are really in shadow (dark in infrared too, unlike
   // evergreen canopy) and that either still read green in infrared or are green in the summer photo.
   const dark = new Uint8Array(n), shadeVeg = new Uint8Array(n), hard = new Uint8Array(n), b3 = X[6];
+  // Hard surface = the hard-surface model is more confident than the lawn model. One exception: a BROAD area that is
+  // green in the summer photo is pale dormant turf, which looks like concrete in winter. Narrow strips (a gravel or
+  // dirt driveway, a walk) stay hard even when the summer photo shows green there - trees overhang them and the
+  // summer photo is too coarse to resolve a two-track drive.
+  const hardRaw = new Uint8Array(n);
+  if (probH) for (let i = 0; i < n; i++) hardRaw[i] = probH[i] > 0.5 && probH[i] > S.prob[i] ? 1 : 0;
+  const strip = new Uint8Array(n);   // long narrow hard strips: driveways and walks
+  if (probH) {
+    const rw = Math.max(3, Math.round(8 * ppf)), broad = morph(morph(morph(hardRaw, w, h, rw, false), w, h, rw, true), w, h, Math.max(2, Math.round(2 * ppf)), true);
+    const thin = new Uint8Array(n); for (let i = 0; i < n; i++) thin[i] = hardRaw[i] && !broad[i] ? 1 : 0;
+    const px = pxAreaSqft();
+    blobs(thin, w, h, 1, (p, cnt) => {   // keep only real strips (40 ft+ long), not the ragged rim of a pale lawn
+      if (cnt * px < 150) return;
+      let x0 = w, x1 = 0, y0 = h, y1 = 0; for (const i of p) { const x = i % w, y = (i - x) / w; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+      if (Math.hypot(x1 - x0, y1 - y0) >= 40 * ppf) for (const i of p) strip[i] = 1;
+    });
+  }
   for (let i = 0; i < n; i++) {
     dark[i] = b3[i] < 0.3 ? 1 : 0;
     // A deciduous tree over turf: under summer canopy, but the winter infrared still shows green at ground level
     // (and it is not evergreen canopy, which is dark to the eye yet bright in infrared). Treated as open ground.
     if (canopy && canopy[i] && nd && nd[i] > 0.3 && !(b3[i] < 0.3 && nir3[i] > 0.5)) canopy[i] = 2;
     if (b3[i] < 0.27 && (!nir3 || nir3[i] < 0.45) && !(canopy && canopy[i] === 1)) shadeVeg[i] = (nd && nd[i] > 0.2) || (ndS && ndS[i] > 0.2 && !canopy[i]) ? 1 : 0;
-    // hard surface: the hard-surface model says so more confidently than the lawn model says lawn - unless the spot is
-    // green in the summer photo, which rules out pavement (pale dormant turf looks a lot like concrete in winter)
-    hard[i] = probH && probH[i] > 0.5 && probH[i] > S.prob[i] && !(ndS && ndS[i] > 0.2) ? 1 : 0;
+    hard[i] = hardRaw[i] && (strip[i] || !(ndS && ndS[i] > 0.2)) ? 1 : 0;
   }
   S.dark = dark; S.shadeVeg = nd || ndS ? shadeVeg : null; S.hard = hard;
+  S.hardP = probH;
   // roofs and pavement inside the parcel, for finding the house when no footprint is mapped
   const imp = new Uint8Array(n);
   for (let i = 0; i < n; i++) imp[i] = S.inParcel[i] && (probH ? hard[i] : S.prob[i] < 0.3 && (nd ? nd[i] < 0.08 : X[3][i] < 0.1)) ? 1 : 0;
@@ -733,7 +764,42 @@ function detect() {
   // under summer tree canopy only unmistakable lawn counts (grass seen through bare branches); marginal ground there is woods
   // (canopy value 2 = tree over visibly green turf, which is treated as open for everything except the patchy-turf spread)
   const can = S.canopy, open = i => !(can && can[i]), woods = i => can && can[i] === 1, thrCan = Math.min(0.95, thr + 0.3);
-  for (let i = 0; i < n; i++) m[i] = S.prob[i] > (woods(i) ? thrCan : thr) && ok(i) ? 1 : 0;
+  // Starting set. The two photos cover each other's blind spots. Winter (sharp, leaf-off) shows turf colour and
+  // texture but cannot tell bare woods floor from dormant grass. Summer (leaf-on) shows exactly where the trees are
+  // and what is bare - dirt drives, gravel, pavement - but is coarser. So with a usable summer photo:
+  //   under woods:       not lawn (a single yard tree is different: lawn may run under it);
+  //   bare in summer:    not lawn, whatever it looks like in winter (dirt drive, gravel, a bed, pavement);
+  //   otherwise:         lawn if the winter model says so.
+  // (Summer greenness alone is not enough to ADD lawn: sunlit gaps between tree crowns are green and smooth too.)
+  // Without one (or if it predates the house, or shows far less lawn than winter does - a yard sodded since),
+  // the winter colour model decides alone.
+  const P0 = S.prob, ndS = S.ndS, BARE = 0.04;   // summer greenness below this is pavement, roof, water or bare ground (even stressed pale turf reads 0.05+)
+  // Is the summer photo older than the house? If what is clearly roof or pavement today was green when it was taken,
+  // the lot has been built on since, and that photo cannot say where the turf is.
+  let bySummer = !!ndS, cw = 0, cs = 0;
+  if (ndS) {
+    let built = 0, wasGreen = 0; const hp = S.hardP;
+    for (let i = 0; i < n; i++) if (S.inParcel[i] && ((bld && bld[i]) || (hp && hp[i] > 0.85 && P0[i] < 0.2))) { built++; if (ndS[i] > 0.3 && !(can && can[i] === 3)) wasGreen++; }   // (a yard tree overhanging the roof does not count)
+    if (built * pxAreaSqft() >= 300 && wasGreen >= built * 0.5) bySummer = false;
+  }
+  for (let i = 0; i < n; i++) {
+    if (!ok(i)) continue;
+    const winter = P0[i] > (woods(i) ? thrCan : thr);
+    if (winter && !woods(i)) cw++;
+    if (bySummer) {
+      const c = can ? can[i] : 0, hp = S.hardP ? S.hardP[i] : 0;
+      // woods (1): never. A lone yard tree (3): only where the winter model is very sure. Elsewhere: the usual bar.
+      // In the open: the usual bar. Under tree crowns: only where the winter model is very sure AND the winter
+      // infrared shows living turf (a woods floor of dead leaves reads ~0 there; turf under a tree 0.1-0.3).
+      const nw = S.ndW;
+      m[i] = ndS[i] > BARE && (c === 0 || c === 2 ? P0[i] > thr : P0[i] > 0.9 && (nw ? nw[i] > LIVE + 0.08 : c === 3 && P0[i] > 0.95)) ? 1 : 0;
+      if (c !== 1 && ndS[i] > BARE && P0[i] > thr) cs++;
+    } else m[i] = winter ? 1 : 0;
+  }
+  if (bySummer && cs < cw * STALE) { bySummer = false; for (let i = 0; i < n; i++) m[i] = ok(i) && P0[i] > (woods(i) ? thrCan : thr) ? 1 : 0; }
+  S.bySummer = bySummer; S.csw = cw ? cs / cw : 1;
+  const stage = (name, mm) => { if (LM.keep) (S.stages = S.stages || {})[name] = mm.slice(); };   // test hook
+  stage('seeds', m);
   const px = pxAreaSqft(), r = Math.max(1, Math.round(1 * ppf));
   // spread from the starting set into touching pixels that pass `test`, at most `maxSteps` pixels outward
   // (only patches of at least `seedSqft` may spread, so a stray speck cannot flood a shaded or marginal area)
@@ -749,13 +815,34 @@ function detect() {
     }
     for (let i = 0; i < n; i++) if (m[i] === 2) m[i] = 1;
   };
+  // A second patch that the model is less sure of AND that is clearly less green than the main lawn in the winter
+  // photo is some other ground (leaf litter, a gravel pad, straw), not more of the same lawn. A real second lawn
+  // (a back yard of the same or a dormant grass) is either confidently turf or about the same colour.
+  if (bySummer) {
+    const parts = []; let main = null;
+    blobs(m, w, h, 1, p => {
+      let c = 0, e = 0, k = 0;
+      for (let q = 0; q < p.length; q += 3) { const i = p[q], j = i * 4, r_ = S.rgb[j], g_ = S.rgb[j + 1], b_ = S.rgb[j + 2]; c += P0[i]; e += (2 * g_ - r_ - b_) / (r_ + g_ + b_ + 5); k++; }
+      const part = { p, conf: c / k, exg: e / k }; parts.push(part); if (!main || p.length > main.p.length) main = part;
+    });
+    for (const s of parts) if (s !== main && s.conf < SURE && s.exg < main.exg - 0.02) for (const i of s.p) m[i] = 0;
+  }
+  stage('seeds2', m);
+  // Lawn runs under trees: from open lawn, spread under the crowns wherever the winter photo shows turf through the
+  // bare branches AND the winter infrared shows it is alive. Leaf litter on a woods floor looks like dormant grass in
+  // colour but is dead in infrared (greenness ~0, against 0.1-0.2 for turf under a tree), so woods stay out.
+  if (bySummer && can) {
+    const ndW = S.ndW;
+    grow(j => ndS[j] > BARE && P0[j] > thr && (can[j] === 3 ? (ndW ? ndW[j] > LIVE : P0[j] > thrCan) : can[j] === 1 && ndW && ndW[j] > LIVE + 0.04), Math.round(TREE * ppf), 200);
+  }
+  stage('trees', m);
   // 0. one lot, one kind of turf: take the colour of the biggest confident patch and treat ground of a clearly
   //    different colour (straw, bare soil or mulch that resembles dormant grass) as not lawn - unless that other-coloured
   //    area is itself big enough to be a second lawn of a different grass. Shadowed pixels are judged later.
   const rgb = S.rgb, turf = new Uint8Array(n).fill(1);
   {
     let dom = null; blobs(m, w, h, 1, (p, cnt) => { if (!dom || cnt > dom.length) dom = p; });
-    if (dom && dom.length * px > 400) {
+    if (!bySummer && dom && dom.length * px > 400) {   // (the summer photo already makes this call when there is one)
       let sr = 0, sg = 0, sb = 0, c = 0;
       for (let k = 0; k < dom.length; k += 3) { const i = dom[k]; if (S.dark[i]) continue; sr += rgb[i * 4]; sg += rgb[i * 4 + 1]; sb += rgb[i * 4 + 2]; c++; }
       if (c > 50) {
@@ -773,13 +860,13 @@ function detect() {
   }
   // 1. thin or patchy turf next to confident lawn counts too (this is what keeps the fill from being blotchy)
   const weak = thr * 0.45, P = S.prob;
-  grow(j => P[j] > weak && open(j) && turf[j], Math.round(30 * ppf), 60);
+  if (!bySummer) grow(j => P[j] > weak && open(j) && turf[j], Math.round(30 * ppf), 60);
   // 2. bridge thin shadows (bare branches, fences) that cut across a lawn: close gaps up to ~8 ft wide through dark pixels
   const rb = Math.max(2, Math.round(4 * ppf)), closed = morph(morph(m, w, h, rb, true), w, h, rb, false);
   for (let i = 0; i < n; i++) if (!m[i] && closed[i] && S.dark[i] && ok(i) && !woods(i)) m[i] = 1;
   // 3. grow into adjoining house / tree shadow that infrared or the summer photo shows is vegetation, up to ~40 ft
   //    (a long tree-line shadow across a big lawn can be 60 ft deep, so the reach scales with the size of the lawn)
-  if (S.shadeVeg) {
+  if (S.shadeVeg && !bySummer) {
     let big0 = 0; blobs(m, w, h, 1, (p, cnt) => { if (cnt > big0) big0 = cnt; });
     const reach = Math.max(30, Math.min(80, 0.25 * Math.sqrt(big0 * px))), sv = S.shadeVeg;
     grow(j => sv[j], Math.round(reach * ppf), 200);
@@ -796,6 +883,7 @@ function detect() {
     // small holes always fill; bigger ones only when they are a tree standing in the lawn (canopy ringed by grass)
     if (blocked < cnt * 0.3 && (cnt * px <= 250 || trees > cnt * 0.6)) for (const i of p) if (ok(i)) m[i] = 1;
   });
+  stage('tidy', m);
   // 5. snap the edge out to where the grass actually stops. The steps above leave a margin of a few feet beside
   //    driveways, walks and beds; here the lawn spreads into touching pixels whose colour matches the lawn right next
   //    to them, and stops at the colour change (pavement, mulch, shadow). Buildings and the lot line still block it.
@@ -809,7 +897,7 @@ function detect() {
     const bm = boxMean(mf, w, h, r5), br = boxMean(cr, w, h, r5), bg = boxMean(cg, w, h, r5), bb = boxMean(cb, w, h, r5);
     const like = new Uint8Array(n);
     for (let i = 0, j = 0; i < n; i++, j += 4) {
-      if (m[i] || bm[i] < 0.06 || !ok2(i) || woods(i) || !turf[i]) continue;
+      if (m[i] || bm[i] < 0.06 || !ok2(i) || woods(i) || !turf[i] || (bySummer && ndS[i] < BARE)) continue;
       const d = Math.abs(rgb[j] / 255 - br[i] / bm[i]) + Math.abs(rgb[j + 1] / 255 - bg[i] / bm[i]) + Math.abs(rgb[j + 2] / 255 - bb[i] / bm[i]);
       if (d < (hard && hard[i] ? 0.07 : 0.15)) like[i] = 1;
     }
@@ -821,6 +909,7 @@ function detect() {
       if (hd < cnt * 0.5) for (const i of p) if (ok2(i)) m[i] = 1;
     });
   }
+  stage('snap', m);
   // 6. simplify: a few clean shapes, not blotches. The amount of smoothing scales with the lawn (about 1.5 ft on a
   //    small yard, up to 6 ft on an acre): fill inlets, shave spurs, fill holes that are not a building or pavement,
   //    drop patches that are small next to the main lawn, then redraw the outline with straight sides.
@@ -831,16 +920,29 @@ function detect() {
   m = morph(morph(m, w, h, ro, false), w, h, ro, true);
   blobs(m, w, h, 0, (p, cnt, border) => {
     if (border || cnt * px > 3000) return;
-    let blocked = 0; for (const i of p) if (!ok(i)) blocked++;
+    let blocked = 0; for (const i of p) if (!ok(i) || (bySummer && ndS[i] < BARE)) blocked++;   // pavement, buildings, bare beds stay holes
     if (blocked < cnt * 0.3) for (const i of p) if (ok2(i)) m[i] = 1;
   });
+  // a patch far from the main lawn (a clearing out in the woods, a neighbour-side strip across the lot) is not yard
+  {
+    let main = null; const parts = [];
+    blobs(m, w, h, 1, p => { parts.push(p); if (!main || p.length > main.length) main = p; });
+    if (main && parts.length > 1) {
+      const cell = Math.max(4, Math.round(8 * ppf)), gw = Math.ceil(w / cell), gh = Math.ceil(h / cell), near = new Uint8Array(gw * gh), reach = Math.ceil(80 * ppf / cell);
+      for (let k = 0; k < main.length; k += 7) { const i = main[k], cx = Math.floor((i % w) / cell), cy = Math.floor(Math.floor(i / w) / cell);
+        for (let y = Math.max(0, cy - reach); y <= Math.min(gh - 1, cy + reach); y++) for (let x = Math.max(0, cx - reach); x <= Math.min(gw - 1, cx + reach); x++) near[y * gw + x] = 1; }
+      for (const p of parts) { if (p === main) continue; let hit = false;
+        for (let k = 0; k < p.length && !hit; k += 5) { const i = p[k]; hit = !!near[Math.floor(Math.floor(i / w) / cell) * gw + Math.floor((i % w) / cell)]; }
+        if (!hit) for (const i of p) m[i] = 0; }
+    }
+  }
   biggest = 0; blobs(m, w, h, 1, (p, cnt) => { if (cnt > biggest) biggest = cnt; });
   blobs(m, w, h, 1, (p, cnt) => {
     let conf = 0; for (let k = 0; k < p.length; k += 4) conf += P[p[k]];
     // drop patches that are small next to the main lawn, or that were built almost entirely out of shadow and weak
     // evidence (the fringe of the woods) rather than ground the model actually recognised as turf
     //    Anything other than the main lawn has to be clearly turf (average confidence 72%+) to be kept at all.
-    if (cnt < biggest * 0.05 || cnt * px < 200 || (cnt < biggest && conf / Math.ceil(p.length / 4) < 0.72)) for (const i of p) m[i] = 0;
+    if (cnt < biggest * 0.05 || cnt * px < 200 || (cnt < biggest && conf / Math.ceil(p.length / 4) < (bySummer ? CONF : 0.65))) for (const i of p) m[i] = 0;
   });
   // long straight sides: the outline may move up to `smooth` feet, but never onto a building or the middle of pavement
   m = straighten(m, w, h, smooth * 0.75 * ppf);
@@ -1117,7 +1219,7 @@ $('png').onclick = () => {
 };
 
 listSaved();
-const LM = window.LM = { S, FEATS, detect, classify, search, loadParcelAt, map, keep: false, model: null, modelHard: null };   // test hooks
+const LM = window.LM = { S, FEATS, detect, classify, search, loadParcelAt, map, keep: false, model: null, modelHard: null, tune: (c, t, l, cf, st) => { CORE = c; TREE = t; LIVE = l; CONF = cf; STALE = st; } };   // test hooks
 </script>
 </body>
 </html>
