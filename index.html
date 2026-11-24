@@ -160,10 +160,10 @@ const INFRARED = [[SVC + '/Imagery/Orthoimagery_Latest_CIR/ImageServer', ''], [S
 const NAIP = ['https://imagery.nationalmap.gov/arcgis/rest/services/USGSNAIPPlus/ImageServer', 'https://imagery.nationalmap.gov/arcgis/rest/services/USGSNAIPImagery/ImageServer'];
 const SQFT_PER_M2 = 10.7639104;
 const FT = 0.3048;
-const PAD_FT = 25;          // imagery margin around the parcel
+const PAD_FT = 60;         // imagery margin around the parcel
 const TARGET_RES_FT = 0.5;  // native imagery resolution
 const MAX_DIM = 2200;       // caps on analysis image size
-const MAX_PX = 1.8e6;
+const MAX_PX = 2.0e6;
 const ZCOL = [[61, 220, 132], [80, 160, 255], [255, 170, 60], [200, 120, 255], [255, 110, 140], [90, 220, 220], [230, 230, 90], [255, 140, 90]];
 
 const $ = id => document.getElementById(id);
@@ -346,7 +346,7 @@ async function loadParcelAt(ll, label) {
 
 async function openParcel(parcel, saved) {
   S.parcel = parcel; S.undo = []; if (out.mode) cancelOutline();
-  S.prob = S.imperv = S.front = S.bld = S.dark = S.shadeVeg = S.hard = S.summer = S.canopy = S.hilite = null; S.edited = false;
+  S.prob = S.imperv = S.front = S.roads = S.bld =S.dark = S.shadeVeg = S.hard = S.summer = S.canopy = S.hilite = null; S.edited = false;
   S.zones = saved && saved.zones ? saved.zones.map(z => ({ id: z.id, name: z.name, on: z.on !== false })) : defaultZones();
   S.zone = S.zones[0].id;
   const latlngs = parcel.rings.map(r => r.map(p => L.latLng(p[1], p[0])));
@@ -367,6 +367,12 @@ async function openParcel(parcel, saved) {
   const xmin = Math.floor((sw.x - pad) / q) * q, ymax = Math.ceil((ne.y + pad) / q) * q;
   const w = Math.ceil((ne.x + pad - xmin) / q) * 16, h = Math.ceil((ymax - (sw.y - pad)) / q) * 16;
   S.G = { xmin, ymax, xmax: xmin + w * res, ymin: ymax - h * res, res, w, h, cos, ppf: FT / (res * cos) };
+  if (LM.keep) {   // test hook: where the grid of the earlier 25 ft margin sits in this one (the test labels were drawn on it)
+    const p0 = 25 * FT / cos, sx = ne.x - sw.x + 2 * p0, sy = ne.y - sw.y + 2 * p0; let r0 = TARGET_RES_FT * FT / cos;
+    r0 *= Math.ceil(Math.max(1, Math.max(sx, sy) / r0 / MAX_DIM, Math.sqrt(sx * sy / (r0 * r0) / MAX_PX)) * 4) / 4;
+    const q0 = r0 * 16, x0 = Math.floor((sw.x - p0) / q0) * q0, y0 = Math.ceil((ne.y + p0) / q0) * q0;
+    S.G.legacy = { k: r0 / res, ox: (x0 - xmin) / res, oy: (ymax - y0) / res, w: Math.ceil((ne.x + p0 - x0) / q0) * 16, h: Math.ceil((y0 - (sw.y - p0)) / q0) * 16 };
+  }
 
   // parcel mask
   const c = document.createElement('canvas'); c.width = w; c.height = h;
@@ -431,7 +437,7 @@ async function openParcel(parcel, saved) {
     classify();
     const [roads, bld] = await Promise.all([soon(roadsP), soon(bldP)]);
     if (S.parcel !== parcel) return;
-    const apply = (r, b) => { if (b !== LATE) S.bld = b; if (r !== LATE && r) S.front = findFront(r); buildZones(); };
+    const apply = (r, b) => { if (b !== LATE) S.bld = b; if (r !== LATE && r) { S.roads = r; S.front = findFront(r); } buildZones(); };
     apply(roads, bld);
     if (saved) status('Loaded saved measurement.');
     else {
@@ -490,6 +496,15 @@ function morph(mask, w, h, r, dilate) {   // binary dilate / erode with a (2r+1)
   for (let y = 0; y < h; y++) { const a = Math.max(0, y - r), b = Math.min(h - 1, y + r);
     for (let x = 0; x < w; x++) { let v = 1 - hit; for (let i = a; i <= b; i++) if (tmp[i * w + x] === hit) { v = hit; break; } out[y * w + x] = v; } }
   return out;
+}
+// distance (in pixels) from every pixel to the nearest set pixel of `src`, and which pixel that is (two-pass chamfer)
+function distMap(src, w, h) {
+  const n = w * h, d = new Float32Array(n).fill(1e9), s = new Int32Array(n).fill(-1), D = Math.SQRT2;
+  for (let i = 0; i < n; i++) if (src[i]) { d[i] = 0; s[i] = i; }
+  const rel = (i, j, c) => { if (d[j] + c < d[i]) { d[i] = d[j] + c; s[i] = s[j]; } };
+  for (let y = 0, i = 0; y < h; y++) for (let x = 0; x < w; x++, i++) { if (!d[i]) continue; if (x) rel(i, i - 1, 1); if (y) { rel(i, i - w, 1); if (x) rel(i, i - w - 1, D); if (x < w - 1) rel(i, i - w + 1, D); } }
+  for (let y = h - 1, i = n - 1; y >= 0; y--) for (let x = w - 1; x >= 0; x--, i--) { if (!d[i]) continue; if (x < w - 1) rel(i, i + 1, 1); if (y < h - 1) { rel(i, i + w, 1); if (x < w - 1) rel(i, i + w + 1, D); if (x) rel(i, i + w - 1, D); } }
+  return { d, s };
 }
 // walk 4-connected blobs of `val`; fn(pixels, count, touchesBorder) is called for each
 function blobs(mask, w, h, val, fn) {
@@ -593,7 +608,7 @@ function nirGain(px, gray, n) {
   const ratio = q.length >= 300 ? pick(q, 0.3) : all.length ? pick(all, 0.08) : 1;   // few grey pixels: use the least-vegetated ones
   return Math.max(0.5, Math.min(2.5, 1 / (ratio || 1)));
 }
-let CORE = 0.92, TREE = 40, LIVE = 0.10, CONF = 0.55, STALE = 0.75, SURE = 0.84, SMALL = 1000, OPEN = 2.5, EPS = 3, PALE = 0.2, YARD = [0.45, 0.42, 2000, 0.06], PAVE = 0.97,SHADE = [0.15, 0.005, 0.06, 0.22, 0.36, 50, 600, 0.045];   // test knobs: how solid canopy must be to count as woods; how far (ft) lawn runs under trees; winter infrared greenness of living turf
+let CORE = 0.92, TREE = 40, LIVE = 0.10, CONF = 0.55, STALE = 0.75, SURE = 0.84, SMALL = 1000, OPEN = 2.5, EPS = 3, PALE = 0.2, YARD = [0.45, 0.42, 2000, 0.06], PAVE = 0.97, BEYOND = [50, 45, 80, 8, 1000, 30], SHADE = [0.15, 0.005, 0.06, 0.22, 0.36, 50, 600, 0.045];   // test knobs: how solid canopy must be to count as woods; how far (ft) lawn runs under trees; winter infrared greenness of living turf
 function computeFeatures() {
   const { w, h, ppf } = S.G, n = w * h, rgb = S.rgb, cir = S.cir;
   const r1 = Math.max(1, Math.round(1.5 * ppf)), r3 = Math.max(2, Math.round(3 * ppf)), r8 = Math.max(4, Math.round(8 * ppf));
@@ -758,11 +773,12 @@ function splitZones(m) {
 function detect() {
   if (!S.prob) return;
   pushUndo();
-  const { w, h, ppf } = S.G, n = w * h, clip = true;   // lawn always stops at the property line
+  const { w, h, ppf } = S.G, n = w * h, inP = S.inParcel;
   const thr = 0.5;
-  let m = new Uint8Array(n);
-  // never lawn: outside the lot (if clipping), a mapped building, or a detected hard surface (roof, driveway, street, patio)
-  const bld = S.bld, hard = S.hard, ok = i => (!clip || S.inParcel[i]) && !(bld && bld[i]) && !(hard && hard[i]);
+  // `lim` is where lawn may be marked: the lot on the first pass; a band around it on the second (see "beyond the lot line")
+  let lim = inP, pfx = '', decided = false;
+  // never lawn: outside `lim`, a mapped building, or a detected hard surface (roof, driveway, street, patio)
+  const bld = S.bld, hard = S.hard, ok = i => lim[i] && !(bld && bld[i]) && !(hard && hard[i]);
   // under summer tree canopy only unmistakable lawn counts (grass seen through bare branches); marginal ground there is woods
   // (canopy value 2 = tree over visibly green turf, which is treated as open for everything except the patchy-turf spread)
   const can = S.canopy, open = i => !(can && can[i]), woods = i => can && can[i] === 1, thrCan = Math.min(0.95, thr + 0.3);
@@ -778,12 +794,20 @@ function detect() {
   const P0 = S.prob, ndS = S.ndS, BARE = 0.04;   // summer greenness below this is pavement, roof, water or bare ground (even stressed pale turf reads 0.05+)
   // Is the summer photo older than the house? If what is clearly roof or pavement today was green when it was taken,
   // the lot has been built on since, and that photo cannot say where the turf is.
-  let bySummer = !!ndS, cw = 0, cs = 0;
+  let bySummer = !!ndS;
   if (ndS) {
     let built = 0, wasGreen = 0; const hp = S.hardP;
     for (let i = 0; i < n; i++) if (S.inParcel[i] && ((bld && bld[i]) || (hp && hp[i] > 0.85 && P0[i] < 0.2))) { built++; if (ndS[i] > 0.3 && !(can && can[i] === 3)) wasGreen++; }   // (a yard tree overhanging the roof does not count)
     if (built * pxAreaSqft() >= 300 && wasGreen >= built * 0.5) bySummer = false;
   }
+  const px = pxAreaSqft(), r = Math.max(1, Math.round(1 * ppf)), P = S.prob, rgb = S.rgb;
+  const ok2 = i => lim[i] && !(bld && bld[i]);
+  const stage = (name, mm) => { if (LM.keep) (S.stages = S.stages || {})[pfx + name] = mm.slice(); };   // test hook
+  // solid concrete or asphalt (the hard-surface model is certain, over a patch at least ~3 ft across): never lawn
+  let paved = null;
+  if (S.hardP) { const hp = S.hardP, c = new Uint8Array(n), rp = Math.max(1, Math.round(1.5 * ppf)); for (let i = 0; i < n; i++) c[i] = hp[i] > PAVE && P0[i] < 0.1 ? 1 : 0; paved = morph(morph(c, w, h, rp, false), w, h, rp, true); }
+  const pass = () => {   // steps 0-5 for whatever area `lim` allows
+  let m = new Uint8Array(n), cw = 0, cs = 0;
   for (let i = 0; i < n; i++) {
     if (!ok(i)) continue;
     const winter = P0[i] > (woods(i) ? thrCan : thr);
@@ -798,11 +822,11 @@ function detect() {
       if (c !== 1 && ndS[i] > BARE && P0[i] > thr) cs++;
     } else m[i] = winter ? 1 : 0;
   }
-  if (bySummer && cs < cw * STALE) { bySummer = false; for (let i = 0; i < n; i++) m[i] = ok(i) && P0[i] > (woods(i) ? thrCan : thr) ? 1 : 0; }
-  S.bySummer = bySummer; S.csw = cw ? cs / cw : 1;
-  const stage = (name, mm) => { if (LM.keep) (S.stages = S.stages || {})[name] = mm.slice(); };   // test hook
+  if (!decided) {
+    if (bySummer && cs < cw * STALE) { bySummer = false; for (let i = 0; i < n; i++) m[i] = ok(i) && P0[i] > (woods(i) ? thrCan : thr) ? 1 : 0; }
+    S.bySummer = bySummer; S.csw = cw ? cs / cw : 1; decided = true;
+  }
   stage('seeds', m);
-  const px = pxAreaSqft(), r = Math.max(1, Math.round(1 * ppf));
   // spread from the starting set into touching pixels that pass `test`, at most `maxSteps` pixels outward
   // (only patches of at least `seedSqft` may spread, so a stray speck cannot flood a shaded or marginal area)
   const grow = (test, maxSteps, seedSqft, allowed = ok) => {
@@ -883,7 +907,7 @@ function detect() {
   // 0. one lot, one kind of turf: take the colour of the biggest confident patch and treat ground of a clearly
   //    different colour (straw, bare soil or mulch that resembles dormant grass) as not lawn - unless that other-coloured
   //    area is itself big enough to be a second lawn of a different grass. Shadowed pixels are judged later.
-  const rgb = S.rgb, turf = new Uint8Array(n).fill(1);
+  const turf = new Uint8Array(n).fill(1);
   {
     let dom = null; blobs(m, w, h, 1, (p, cnt) => { if (!dom || cnt > dom.length) dom = p; });
     if (!bySummer && dom && dom.length * px > 400) {   // (the summer photo already makes this call when there is one)
@@ -903,7 +927,7 @@ function detect() {
     }
   }
   // 1. thin or patchy turf next to confident lawn counts too (this is what keeps the fill from being blotchy)
-  const weak = thr * 0.45, P = S.prob;
+  const weak = thr * 0.45;
   if (!bySummer) grow(j => P[j] > weak && open(j) && turf[j], Math.round(30 * ppf), 60);
   // 2. bridge thin shadows (bare branches, fences) that cut across a lawn: close gaps up to ~8 ft wide through dark pixels
   const rb = Math.max(2, Math.round(4 * ppf)), closed = morph(morph(m, w, h, rb, true), w, h, rb, false);
@@ -933,10 +957,6 @@ function detect() {
   //    to them, and stops at the colour change (pavement, mulch, shadow). Buildings and the lot line still block it.
   //    Pixels the hard-surface model flagged must match the lawn colour much more closely, which keeps a dirt or gravel
   //    drive that is only a little lighter than the lawn from being swallowed.
-  const ok2 = i => (!clip || S.inParcel[i]) && !(bld && bld[i]);
-  // solid concrete or asphalt (the hard-surface model is certain, over a patch at least ~3 ft across): never lawn
-  let paved = null;
-  if (S.hardP) { const hp = S.hardP, c = new Uint8Array(n), rp = Math.max(1, Math.round(1.5 * ppf)); for (let i = 0; i < n; i++) c[i] = hp[i] > PAVE && P0[i] < 0.1 ? 1 : 0; paved = morph(morph(c, w, h, rp, false), w, h, rp, true); }
   {
     const r5 = Math.max(3, Math.round(5 * ppf));
     const mf = new Float32Array(n), cr = new Float32Array(n), cg = new Float32Array(n), cb = new Float32Array(n);
@@ -946,6 +966,7 @@ function detect() {
     for (let i = 0, j = 0; i < n; i++, j += 4) {
       if (m[i] || bm[i] < 0.06 || !ok2(i) || woods(i) || !turf[i] || (bySummer && ndS[i] < BARE)) continue;
       const d = Math.abs(rgb[j] / 255 - br[i] / bm[i]) + Math.abs(rgb[j + 1] / 255 - bg[i] / bm[i]) + Math.abs(rgb[j + 2] / 255 - bb[i] / bm[i]);
+      if (hard && hard[i] && S.hardP && S.hardP[i] > 0.75) continue;   // clearly a drive or walk, however close its colour
       if (d < (hard && hard[i] ? 0.07 : 0.15)) like[i] = 1;
     }
     grow(j => like[j], Math.round(8 * ppf), 0, ok2);
@@ -973,6 +994,58 @@ function detect() {
     });
   }
   stage('snap', m);
+  return { m, shadeYard, treeYard };
+  };
+  let { m, shadeYard, treeYard } = pass();
+  // Beyond the lot line. People mow past their line: nearly always the strip between the lot and the road (ditch,
+  // culvert, the grass outside the sidewalk), and now and then a corner of a neighbour's land that reads as part of
+  // this yard. So the same steps are run again on a band around the lot, and of the lawn found out there only this
+  // is kept: (a) the strip straight out from the lot's road frontage, up to the road; (b) a pocket that opens only
+  // onto this lot's lawn: it is closed off (it does not carry on past the band) and no one else's building stands
+  // near it. A neighbour's own yard fails (b) on both counts, so on an ordinary subdivision lot the line still holds.
+  const frontAcc = new Uint8Array(n);
+  if (BEYOND && bySummer) {
+    const D = BEYOND[0] * ppf, { d, s } = distMap(inP, w, h), roads = S.roads, reach = inP.slice(), front = new Uint8Array(n), srcRd = new Map();
+    const rd = (x, y) => { let b = 1e9; for (const path of roads) for (let k = 0; k + 1 < path.length; k++) { const [ax, ay] = path[k], [bx, by] = path[k + 1], dx = bx - ax, dy = by - ay, L2 = dx * dx + dy * dy, t = L2 ? Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / L2)) : 0, q = Math.hypot(ax + t * dx - x, ay + t * dy - y); if (q < b) b = q; } return b; };
+    for (let y = 0, i = 0; y < h; y++) for (let x = 0; x < w; x++, i++) {
+      if (inP[i] || s[i] < 0) continue;
+      const j = s[i], sx = j % w, sy = (j - sx) / w, dp = Math.hypot(x - sx, y - sy);
+      if (dp > D) continue;
+      reach[i] = 1;
+      if (roads && roads.length && dp <= BEYOND[1] * ppf) {   // between the lot's frontage and the road, not out on the road itself
+        let a = srcRd.get(j); if (a === undefined) srcRd.set(j, a = rd(sx, sy));
+        if (a <= BEYOND[2] * ppf) { const b = rd(x, y); if (b > BEYOND[3] * ppf && a - b >= 0.75 * dp) front[i] = 1; }
+      }
+    }
+    lim = reach; pfx = 'x_'; const B = pass(); pfx = '';
+    const out = new Uint8Array(n), acc = new Uint8Array(n);
+    for (let i = 0; i < n; i++) if (B.m[i] && !inP[i]) { if (front[i]) acc[i] = 2; else out[i] = 1; }
+    let lotLawn = 0; for (let i = 0; i < n; i++) lotLawn += m[i];
+    if (bld) {
+      // someone else's building: a mapped footprint off the lot, or (footprints miss some) a solid roof-sized hard surface there
+      const oth = new Uint8Array(n), hp = S.hardP, re = Math.round(5 * ppf);
+      if (hp) { for (let i = 0; i < n; i++) oth[i] = !inP[i] && hp[i] > 0.9 ? 1 : 0; const e = morph(oth, w, h, re, false); for (let i = 0; i < n; i++) oth[i] = e[i]; }
+      for (let i = 0; i < n; i++) if (bld[i] && !inP[i]) oth[i] = 1;
+      const dOth = distMap(oth, w, h).d;
+      blobs(out, w, h, 1, (p, cnt, border) => {
+        if (border || cnt * px < BEYOND[4] || cnt > lotLawn) return;
+        let far = 0, theirs = 0, shady = 0; for (const i of p) { if (d[i] > D - 3 * ppf) far++; if (dOth[i] < BEYOND[5] * ppf) theirs++; if ((can && (can[i] === 1 || can[i] === 3)) || B.shadeYard[i] || B.treeYard[i]) shady++; }
+        if (far * px > 60 || theirs || shady > cnt * 0.25) return;   // (open lawn only: ground under trees past the line is the woods behind the lot)
+        for (const i of p) acc[i] = 1;
+      });
+    }
+    // either kind has to adjoin lawn on the lot itself
+    const nearLawn = morph(m, w, h, Math.round(10 * ppf), true), any = new Uint8Array(n); for (let i = 0; i < n; i++) any[i] = acc[i] ? 1 : 0;
+    blobs(any, w, h, 1, p => { let hit = false; for (let k = 0; k < p.length && !hit; k++) hit = !!nearLawn[p[k]]; if (!hit) for (const i of p) acc[i] = 0; });
+    if (LM.keep) { S.beyond = { reach, front, acc: acc.slice(), out }; }
+    const grown = morph(any, w, h, Math.max(2, Math.round(3 * ppf)), true), allowed = inP.slice();
+    for (let i = 0; i < n; i++) {
+      if (acc[i]) { m[i] = 1; if (B.shadeYard[i]) shadeYard[i] = 1; if (B.treeYard[i]) treeYard[i] = 1; if (acc[i] === 2) frontAcc[i] = 1; }
+      if (grown[i] && reach[i] && (acc[i] || !B.m[i])) allowed[i] = 1;   // room for the clean-up to straighten the edge, but not onto lawn that was judged not to belong
+    }
+    lim = allowed;
+    stage('beyond', m);
+  }
   // 6. simplify: a few clean shapes, not blotches. The amount of smoothing scales with the lawn (about 1.5 ft on a
   //    small yard, up to 6 ft on an acre): fill inlets, shave spurs, fill holes that are not a building or pavement,
   //    drop patches that are small next to the main lawn, then redraw the outline with straight sides.
@@ -1003,7 +1076,8 @@ function detect() {
   }
   biggest = 0; blobs(m, w, h, 1, (p, cnt) => { if (cnt > biggest) biggest = cnt; });
   blobs(m, w, h, 1, (p, cnt) => {
-    let conf = 0, sh = 0; for (let k = 0; k < p.length; k += 4) { conf += P[p[k]]; sh += shadeYard[p[k]] || treeYard[p[k]]; }
+    let conf = 0, sh = 0, fr = 0; for (let k = 0; k < p.length; k += 4) { conf += P[p[k]]; sh += shadeYard[p[k]] || treeYard[p[k]]; fr += frontAcc[p[k]]; }
+    if (fr > p.length / 8 && cnt * px >= 150) return;   // the strip between a sidewalk and the street is small and stands alone
     if (sh > p.length / 8 && cnt * px >= 400) return;   // a shaded yard by the house was judged on its own evidence above
     // drop patches that are small next to the main lawn, or that were built almost entirely out of shadow and weak
     // evidence (the fringe of the woods) rather than ground the model actually recognised as turf
@@ -1014,7 +1088,7 @@ function detect() {
   stage('drop6', m);
   const pre = m; m = straighten(m, w, h, Math.min(smooth * 0.75, EPS) * ppf);
   stage('straight', m);
-  const hardCore = hard ? morph(hard, w, h, Math.max(2, Math.round(1.5 * ppf)), false) : null;
+  const hardCore = hard ? morph(hard, w, h, Math.max(1, Math.round(0.5 * ppf)), false) : null;   // (the redraw may shave a drive's edge by half a foot, no more)
   // (pale turf that step 5 matched to the lawn beside it stays, even where the hard-surface model had flagged it)
   for (let i = 0; i < n; i++) if (m[i] && (!ok2(i) || (hardCore && hardCore[i] && !pre[i]) || (paved && paved[i]))) m[i] = 0;
   blobs(m, w, h, 1, (p, cnt) => { if (cnt * px < 200) for (const i of p) m[i] = 0; });   // crumbs left by the redraw
@@ -1288,7 +1362,7 @@ $('png').onclick = () => {
 };
 
 listSaved();
-const LM = window.LM = { S, FEATS, detect, classify, search, loadParcelAt, map, keep: false, model: null, modelHard: null, tune: (c, t, l, cf, st) => { CORE = c; TREE = t; LIVE = l; CONF = cf; STALE = st; }, tune2: (sm, sh, op, ep, pa) => { SMALL = sm; if (sh) SHADE = sh; if (op) OPEN = op; if (ep) EPS = ep; if (pa != null) PALE = pa; }, tune3: (y, pv) => { YARD = y; if (pv) PAVE = pv; } };   // test hooks
+const LM = window.LM = { S, FEATS, detect, classify, search, loadParcelAt, map, keep: false, model: null, modelHard: null, tune: (c, t, l, cf, st) => { CORE = c; TREE = t; LIVE = l; CONF = cf; STALE = st; }, tune2: (sm, sh, op, ep, pa) => { SMALL = sm; if (sh) SHADE = sh; if (op) OPEN = op; if (ep) EPS = ep; if (pa != null) PALE = pa; }, tune3: (y, pv) => { YARD = y; if (pv) PAVE = pv; }, tune4: b => { BEYOND = b; } };   // test hooks
 </script>
 </body>
 </html>
