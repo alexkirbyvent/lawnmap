@@ -608,7 +608,7 @@ function nirGain(px, gray, n) {
   const ratio = q.length >= 300 ? pick(q, 0.3) : all.length ? pick(all, 0.08) : 1;   // few grey pixels: use the least-vegetated ones
   return Math.max(0.5, Math.min(2.5, 1 / (ratio || 1)));
 }
-let CORE = 0.92, TREE = 40, LIVE = 0.10, CONF = 0.55, STALE = 0.75, SURE = 0.84, SMALL = 1000, OPEN = 2.5, EPS = 3, PALE = 0.3, GREY = 0.045, YARD = [0.45, 0.42, 2000, 0.06], PAVE = 0.97, BEYOND = [50, 45, 80, 8, 1000, 30], TRACK = [0.035, 0.63, 30, 14], SHADE = [0.15, 0.005, 0.06, 0.22, 0.36, 50, 600, 0.045];   // test knobs: how solid canopy must be to count as woods; how far (ft) lawn runs under trees; winter infrared greenness of living turf
+let CORE = 0.92, TREE = 40, LIVE = 0.10, CONF = 0.55, STALE = 0.75, SURE = 0.84, SMALL = 1000, OPEN = 2.5, EPS = 3, PALE = 0.3, GREY = 0.045, YARD = [0.45, 0.42, 2000, 0.06], PAVE = 0.97, BEYOND = [50, 45, 80, 8, 1000, 30], TRACK = [0.035, 0.63, 30, 14], SAME = [0.3, 0.07, 400, 30], SHADE = [0.15, 0.005, 0.06, 0.22, 0.36, 50, 600, 0.045];   // test knobs: how solid canopy must be to count as woods; how far (ft) lawn runs under trees; winter infrared greenness of living turf
 function computeFeatures() {
   const { w, h, ppf } = S.G, n = w * h, rgb = S.rgb, cir = S.cir;
   const r1 = Math.max(1, Math.round(1.5 * ppf)), r3 = Math.max(2, Math.round(3 * ppf)), r8 = Math.max(4, Math.round(8 * ppf));
@@ -822,6 +822,7 @@ function detect() {
     });
     if (any) { const g = morph(trk, w, h, Math.max(1, Math.round(1.5 * ppf)), true); if (!paved) paved = new Uint8Array(n); for (let i = 0; i < n; i++) if (g[i]) paved[i] = 1; if (LM.keep) S.track = g; }
   }
+  const sameTurf = new Uint8Array(n);
   const pass = () => {   // steps 0-5 for whatever area `lim` allows
   let m = new Uint8Array(n), cw = 0, cs = 0;
   for (let i = 0; i < n; i++) {
@@ -918,6 +919,25 @@ function detect() {
     const rr = Math.max(2, Math.round(4 * ppf)); m = morph(morph(m, w, h, rr, true), w, h, rr, false);   // bridge trunk shadows
     blobs(m, w, h, 1, (p, cnt) => { if (cnt * px >= YARD[2]) for (const i of p) if (under(i)) treeYard[i] = 1; });
     m = keep; for (let i = 0; i < n; i++) if (treeYard[i]) m[i] = 1;
+  }
+  // The same turf as the confident lawn right next to it - typically a panel of lawn boxed in by walks, pale enough
+  // that the model wavers pixel by pixel. Averaged over a few feet it is clearly the neighbouring lawn's colour, not
+  // grey like pavement, green in summer, and the model gives it far better odds than it gives a straw or mulch bed.
+  if (bySummer && SAME) {
+    const r3 = Math.max(2, Math.round(3 * ppf)), rs = Math.max(3, Math.round(5 * ppf));
+    const sure = new Uint8Array(n), mf = new Float32Array(n), cr = new Float32Array(n), cg = new Float32Array(n), cb = new Float32Array(n), R = new Float32Array(n), G = new Float32Array(n), B = new Float32Array(n);
+    for (let i = 0, j = 0; i < n; i++, j += 4) { R[i] = rgb[j] / 255; G[i] = rgb[j + 1] / 255; B[i] = rgb[j + 2] / 255; if (m[i] && P0[i] > 0.8) { sure[i] = 1; mf[i] = 1; cr[i] = R[i]; cg[i] = G[i]; cb[i] = B[i]; } }
+    // each spot is compared with the confident lawn nearest to it (its colour averaged over ~5 ft), up to 30 ft away
+    const bm = boxMean(mf, w, h, rs), br = boxMean(cr, w, h, rs), bg = boxMean(cg, w, h, rs), bb = boxMean(cb, w, h, rs), { d: dl, s: sl } = distMap(sure, w, h);
+    const R3 = boxMean(R, w, h, r3), G3 = boxMean(G, w, h, r3), B3 = boxMean(B, w, h, r3), Ps = boxMean(P0, w, h, rs), cand = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+      if (m[i] || !ok2(i) || (can && can[i] && can[i] !== 2) || ndS[i] < 0.1 || (paved && paved[i]) || sl[i] < 0 || dl[i] > SAME[3] * ppf || Ps[i] < SAME[0]) continue;
+      const q = sl[i], k = bm[q] || 1;
+      if (Math.abs(R3[i] - br[q] / k) + Math.abs(G3[i] - bg[q] / k) + Math.abs(B3[i] - bb[q] / k) < SAME[1] && R3[i] - B3[i] > GREY * (R3[i] + G3[i] + B3[i])) cand[i] = 1;
+    }
+    const keep = m, rr = Math.max(2, Math.round(2 * ppf)), c2 = morph(morph(cand, w, h, rr, true), w, h, rr, false);
+    blobs(c2, w, h, 1, (p, cnt) => { if (cnt * px >= SAME[2]) for (const i of p) if (!keep[i] && ok2(i) && !(paved && paved[i]) && !(can && can[i] && can[i] !== 2)) { shadeYard[i] = 1; sameTurf[i] = 1; keep[i] = 1; } });
+    if (LM.keep) S.same = c2;
   }
   stage('shade', m);
   // 0. one lot, one kind of turf: take the colour of the biggest confident patch and treat ground of a clearly
@@ -1032,10 +1052,23 @@ function detect() {
         for (let i = 0, j = 0; i < n; i++, j += 4) if (rim[i] && um[i] > 0.05 && Math.abs(rgb[j] / 255 - ur[i] / um[i]) + Math.abs(rgb[j + 1] / 255 - ug[i] / um[i]) + Math.abs(rgb[j + 2] / 255 - ub[i] / um[i]) < 0.15) pale[i] = 1;
       }
       if (LM.keep) S.pale = pale;
-      grow(j => pale[j], Math.round(15 * ppf), 200, ok2);
+      // The lawn takes that turf in 5 ft hops, and only where it is about the colour of the lawn it is spreading
+      // from - a mulch or straw bed beside the walk is not pavement-coloured either, but it is not the lawn's colour.
+      const paleGrow = hops => {
+        for (let hop = 0; hop < hops; hop++) {
+          const mf = new Float32Array(n), cr = new Float32Array(n), cg = new Float32Array(n), cb = new Float32Array(n);
+          for (let i = 0, j = 0; i < n; i++, j += 4) if (m[i]) { mf[i] = 1; cr[i] = rgb[j] / 255; cg[i] = rgb[j + 1] / 255; cb[i] = rgb[j + 2] / 255; }
+          const bm = boxMean(mf, w, h, r5), br = boxMean(cr, w, h, r5), bg = boxMean(cg, w, h, r5), bb = boxMean(cb, w, h, r5), go = new Uint8Array(n);
+          let any = false;
+          for (let i = 0, j = 0; i < n; i++, j += 4) if (pale[i] && !m[i] && bm[i] >= 0.06 && Math.abs(rgb[j] / 255 - br[i] / bm[i]) + Math.abs(rgb[j + 1] / 255 - bg[i] / bm[i]) + Math.abs(rgb[j + 2] / 255 - bb[i] / bm[i]) < 0.2) { go[i] = 1; any = true; }
+          if (!any) break;
+          grow(j => go[j], Math.round(5 * ppf), 200, ok2);
+        }
+      };
+      paleGrow(3);
       // Between the lawn and that strip there is often a band the model was merely unsure of. Now that the turf by
       // the walk is known, match colours again within reach of the pavement and carry the lawn across, twice over.
-      for (let it = 0; it < 2; it++) { snapTo(qm); grow(j => pale[j], Math.round(15 * ppf), 200, ok2); }
+      for (let it = 0; it < 2; it++) { snapTo(qm); paleGrow(2); }
     }
     m = morph(morph(m, w, h, r, true), w, h, r, false);
     blobs(m, w, h, 0, (p, cnt, border) => {   // fill leftover pinholes, but not ones that are mostly hard surface
@@ -1128,7 +1161,8 @@ function detect() {
   biggest = 0; blobs(m, w, h, 1, (p, cnt) => { if (cnt > biggest) biggest = cnt; });
   const roadside = [];
   blobs(m, w, h, 1, (p, cnt) => {
-    let conf = 0, sh = 0, fr = 0; for (let k = 0; k < p.length; k += 4) { conf += P[p[k]]; sh += shadeYard[p[k]] || treeYard[p[k]]; fr += frontAcc[p[k]]; }
+    let conf = 0, sh = 0, fr = 0, sm = 0; for (let k = 0; k < p.length; k += 4) { conf += P[p[k]]; sh += shadeYard[p[k]] || treeYard[p[k]]; fr += frontAcc[p[k]]; sm += sameTurf[p[k]]; }
+    if (sm > p.length / 16 && cnt * px >= SAME[2]) return;   // a panel of the neighbouring lawn's own turf (a quarter of it matched outright)
     if (sh > p.length / 8 && cnt * px >= 400) return;   // a shaded yard by the house was judged on its own evidence above
     // drop patches that are small next to the main lawn, or that were built almost entirely out of shadow and weak
     // evidence (the fringe of the woods) rather than ground the model actually recognised as turf
@@ -1431,7 +1465,7 @@ $('png').onclick = () => {
 };
 
 listSaved();
-const LM = window.LM = { S, FEATS, detect, classify, search, loadParcelAt, map, keep: false, model: null, modelHard: null, tune: (c, t, l, cf, st) => { CORE = c; TREE = t; LIVE = l; CONF = cf; STALE = st; }, tune2: (sm, sh, op, ep, pa) => { SMALL = sm; if (sh) SHADE = sh; if (op) OPEN = op; if (ep) EPS = ep; if (pa != null) PALE = pa; }, tune3: (y, pv) => { YARD = y; if (pv) PAVE = pv; }, tune4: (b, t) => { if (b) BEYOND = b; if (t !== undefined) TRACK = t; } };   // test hooks
+const LM = window.LM = { S, FEATS, detect, classify, search, loadParcelAt, map, keep: false, model: null, modelHard: null, tune: (c, t, l, cf, st) => { CORE = c; TREE = t; LIVE = l; CONF = cf; STALE = st; }, tune2: (sm, sh, op, ep, pa) => { SMALL = sm; if (sh) SHADE = sh; if (op) OPEN = op; if (ep) EPS = ep; if (pa != null) PALE = pa; }, tune3: (y, pv) => { YARD = y; if (pv) PAVE = pv; }, tune4: (b, t, s) => { if (b) BEYOND = b; if (t !== undefined) TRACK = t; if (s !== undefined) SAME = s; } };   // test hooks
 </script>
 </body>
 </html>
