@@ -608,7 +608,7 @@ function nirGain(px, gray, n) {
   const ratio = q.length >= 300 ? pick(q, 0.3) : all.length ? pick(all, 0.08) : 1;   // few grey pixels: use the least-vegetated ones
   return Math.max(0.5, Math.min(2.5, 1 / (ratio || 1)));
 }
-let CORE = 0.92, TREE = 40, LIVE = 0.10, CONF = 0.55, STALE = 0.75, SURE = 0.84, SMALL = 1000, OPEN = 2.5, EPS = 3, PALE = 0.2, YARD = [0.45, 0.42, 2000, 0.06], PAVE = 0.97, BEYOND = [50, 45, 80, 8, 1000, 30], SHADE = [0.15, 0.005, 0.06, 0.22, 0.36, 50, 600, 0.045];   // test knobs: how solid canopy must be to count as woods; how far (ft) lawn runs under trees; winter infrared greenness of living turf
+let CORE = 0.92, TREE = 40, LIVE = 0.10, CONF = 0.55, STALE = 0.75, SURE = 0.84, SMALL = 1000, OPEN = 2.5, EPS = 3, PALE = 0.2, YARD = [0.45, 0.42, 2000, 0.06], PAVE = 0.97, BEYOND = [50, 45, 80, 8, 1000, 30], TRACK = [0.035, 0.63, 30, 14], SHADE = [0.15, 0.005, 0.06, 0.22, 0.36, 50, 600, 0.045];   // test knobs: how solid canopy must be to count as woods; how far (ft) lawn runs under trees; winter infrared greenness of living turf
 function computeFeatures() {
   const { w, h, ppf } = S.G, n = w * h, rgb = S.rgb, cir = S.cir;
   const r1 = Math.max(1, Math.round(1.5 * ppf)), r3 = Math.max(2, Math.round(3 * ppf)), r8 = Math.max(4, Math.round(8 * ppf));
@@ -806,6 +806,21 @@ function detect() {
   // solid concrete or asphalt (the hard-surface model is certain, over a patch at least ~3 ft across): never lawn
   let paved = null;
   if (S.hardP) { const hp = S.hardP, c = new Uint8Array(n), rp = Math.max(1, Math.round(1.5 * ppf)); for (let i = 0; i < n; i++) c[i] = hp[i] > PAVE && P0[i] < 0.1 ? 1 : 0; paved = morph(morph(c, w, h, rp, false), w, h, rp, true); }
+  // A dirt or gravel track through a yard under trees. The hard-surface model does not see it (packed dirt is the
+  // colour of dormant grass), but it is a long narrow strip that is brighter than the ground beside it and dead in
+  // the winter infrared. Only looked for under tree cover, where the lawn itself is judged on weak evidence; out in
+  // the open a dormant lawn is bright and dead too.
+  if (TRACK && bySummer && can && S.ndW && S.b3) {
+    const rt = Math.max(2, Math.round(1.5 * ppf)), nwT = boxMean(S.ndW, w, h, rt), brT = boxMean(S.b3, w, h, rt), t = new Uint8Array(n), trk = new Uint8Array(n);
+    for (let i = 0; i < n; i++) t[i] = (can[i] === 1 || can[i] === 3) && !(bld && bld[i]) && nwT[i] < TRACK[0] && brT[i] > TRACK[1] ? 1 : 0;
+    let any = false;
+    blobs(t, w, h, 1, (p, cnt) => {
+      let x0 = w, x1 = 0, y0 = h, y1 = 0; for (const i of p) { const x = i % w, y = (i - x) / w; if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+      const len = Math.hypot(x1 - x0, y1 - y0) / ppf;
+      if (len >= TRACK[2] && cnt * px <= len * TRACK[3]) { any = true; for (const i of p) trk[i] = 1; }
+    });
+    if (any) { const g = morph(trk, w, h, Math.max(1, Math.round(1.5 * ppf)), true); if (!paved) paved = new Uint8Array(n); for (let i = 0; i < n; i++) if (g[i]) paved[i] = 1; if (LM.keep) S.track = g; }
+  }
   const pass = () => {   // steps 0-5 for whatever area `lim` allows
   let m = new Uint8Array(n), cw = 0, cs = 0;
   for (let i = 0; i < n; i++) {
@@ -1362,7 +1377,7 @@ $('png').onclick = () => {
 };
 
 listSaved();
-const LM = window.LM = { S, FEATS, detect, classify, search, loadParcelAt, map, keep: false, model: null, modelHard: null, tune: (c, t, l, cf, st) => { CORE = c; TREE = t; LIVE = l; CONF = cf; STALE = st; }, tune2: (sm, sh, op, ep, pa) => { SMALL = sm; if (sh) SHADE = sh; if (op) OPEN = op; if (ep) EPS = ep; if (pa != null) PALE = pa; }, tune3: (y, pv) => { YARD = y; if (pv) PAVE = pv; }, tune4: b => { BEYOND = b; } };   // test hooks
+const LM = window.LM = { S, FEATS, detect, classify, search, loadParcelAt, map, keep: false, model: null, modelHard: null, tune: (c, t, l, cf, st) => { CORE = c; TREE = t; LIVE = l; CONF = cf; STALE = st; }, tune2: (sm, sh, op, ep, pa) => { SMALL = sm; if (sh) SHADE = sh; if (op) OPEN = op; if (ep) EPS = ep; if (pa != null) PALE = pa; }, tune3: (y, pv) => { YARD = y; if (pv) PAVE = pv; }, tune4: (b, t) => { if (b) BEYOND = b; if (t !== undefined) TRACK = t; } };   // test hooks
 </script>
 </body>
 </html>
