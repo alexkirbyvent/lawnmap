@@ -608,7 +608,7 @@ function nirGain(px, gray, n) {
   const ratio = q.length >= 300 ? pick(q, 0.3) : all.length ? pick(all, 0.08) : 1;   // few grey pixels: use the least-vegetated ones
   return Math.max(0.5, Math.min(2.5, 1 / (ratio || 1)));
 }
-let CORE = 0.92, TREE = 40, LIVE = 0.10, CONF = 0.55, STALE = 0.75, SURE = 0.84, SMALL = 1000, OPEN = 2.5, EPS = 3, PALE = 0.2, YARD = [0.45, 0.42, 2000, 0.06], PAVE = 0.97, BEYOND = [50, 45, 80, 8, 1000, 30], TRACK = [0.035, 0.63, 30, 14], SHADE = [0.15, 0.005, 0.06, 0.22, 0.36, 50, 600, 0.045];   // test knobs: how solid canopy must be to count as woods; how far (ft) lawn runs under trees; winter infrared greenness of living turf
+let CORE = 0.92, TREE = 40, LIVE = 0.10, CONF = 0.55, STALE = 0.75, SURE = 0.84, SMALL = 1000, OPEN = 2.5, EPS = 3, PALE = 0.3, GREY = 0.045, YARD = [0.45, 0.42, 2000, 0.06], PAVE = 0.97, BEYOND = [50, 45, 80, 8, 1000, 30], TRACK = [0.035, 0.63, 30, 14], SHADE = [0.15, 0.005, 0.06, 0.22, 0.36, 50, 600, 0.045];   // test knobs: how solid canopy must be to count as woods; how far (ft) lawn runs under trees; winter infrared greenness of living turf
 function computeFeatures() {
   const { w, h, ppf } = S.G, n = w * h, rgb = S.rgb, cir = S.cir;
   const r1 = Math.max(1, Math.round(1.5 * ppf)), r3 = Math.max(2, Math.round(3 * ppf)), r8 = Math.max(4, Math.round(8 * ppf));
@@ -810,6 +810,7 @@ function detect() {
   // colour of dormant grass), but it is a long narrow strip that is brighter than the ground beside it and dead in
   // the winter infrared. Only looked for under tree cover, where the lawn itself is judged on weak evidence; out in
   // the open a dormant lawn is bright and dead too.
+  const byHouse = bld ? morph(bld, w, h, Math.round(8 * ppf), true) : null;   // within 8 ft of a mapped building
   if (TRACK && bySummer && can && S.ndW && S.b3) {
     const rt = Math.max(2, Math.round(1.5 * ppf)), nwT = boxMean(S.ndW, w, h, rt), brT = boxMean(S.b3, w, h, rt), t = new Uint8Array(n), trk = new Uint8Array(n);
     for (let i = 0; i < n; i++) t[i] = (can[i] === 1 || can[i] === 3) && !(bld && bld[i]) && nwT[i] < TRACK[0] && brT[i] > TRACK[1] ? 1 : 0;
@@ -974,32 +975,67 @@ function detect() {
   //    drive that is only a little lighter than the lawn from being swallowed.
   {
     const r5 = Math.max(3, Math.round(5 * ppf));
-    const mf = new Float32Array(n), cr = new Float32Array(n), cg = new Float32Array(n), cb = new Float32Array(n);
-    for (let i = 0, j = 0; i < n; i++, j += 4) if (m[i]) { mf[i] = 1; cr[i] = rgb[j] / 255; cg[i] = rgb[j + 1] / 255; cb[i] = rgb[j + 2] / 255; }
-    const bm = boxMean(mf, w, h, r5), br = boxMean(cr, w, h, r5), bg = boxMean(cg, w, h, r5), bb = boxMean(cb, w, h, r5);
-    const like = new Uint8Array(n);
-    for (let i = 0, j = 0; i < n; i++, j += 4) {
-      if (m[i] || bm[i] < 0.06 || !ok2(i) || woods(i) || !turf[i] || (bySummer && ndS[i] < BARE)) continue;
-      const d = Math.abs(rgb[j] / 255 - br[i] / bm[i]) + Math.abs(rgb[j + 1] / 255 - bg[i] / bm[i]) + Math.abs(rgb[j + 2] / 255 - bb[i] / bm[i]);
-      if (hard && hard[i] && S.hardP && S.hardP[i] > 0.75) continue;   // clearly a drive or walk, however close its colour
-      if (d < (hard && hard[i] ? 0.07 : 0.15)) like[i] = 1;
-    }
-    grow(j => like[j], Math.round(8 * ppf), 0, ok2);
+    const snapTo = near => {   // (`near`: only where this is set)
+      const mf = new Float32Array(n), cr = new Float32Array(n), cg = new Float32Array(n), cb = new Float32Array(n);
+      for (let i = 0, j = 0; i < n; i++, j += 4) if (m[i]) { mf[i] = 1; cr[i] = rgb[j] / 255; cg[i] = rgb[j + 1] / 255; cb[i] = rgb[j + 2] / 255; }
+      const bm = boxMean(mf, w, h, r5), br = boxMean(cr, w, h, r5), bg = boxMean(cg, w, h, r5), bb = boxMean(cb, w, h, r5);
+      const like = new Uint8Array(n);
+      for (let i = 0, j = 0; i < n; i++, j += 4) {
+        if (m[i] || bm[i] < 0.06 || !ok2(i) || woods(i) || !turf[i] || (bySummer && ndS[i] < BARE) || (near && (near[i] < 0.01 || (byHouse && byHouse[i])))) continue;
+        const d = Math.abs(rgb[j] / 255 - br[i] / bm[i]) + Math.abs(rgb[j + 1] / 255 - bg[i] / bm[i]) + Math.abs(rgb[j + 2] / 255 - bb[i] / bm[i]);
+        if (hard && hard[i] && S.hardP && S.hardP[i] > 0.75) continue;   // clearly a drive or walk, however close its colour
+        if (d < (hard && hard[i] ? 0.07 : 0.15)) like[i] = 1;
+      }
+      grow(j => like[j], Math.round(8 * ppf), 0, ok2);
+    };
+    snapTo(null);
     // Pale dormant turf beside a drive or walk reads as pavement in the winter photo, which leaves a ragged gap
     // between the lawn and the concrete. Where the summer photo shows real pavement close by (bare, in the open),
     // ground that is a clearly different colour from that pavement and not bare in summer is turf: the lawn runs
     // across it, up to the pavement itself.
     if (bySummer && hard && S.hardP && PALE) {
-      const hp = S.hardP, rp = Math.round(30 * ppf), pf = new Float32Array(n), pr = new Float32Array(n), pg = new Float32Array(n), pb = new Float32Array(n);
-      for (let i = 0, j = 0; i < n; i++, j += 4) if (hp[i] > 0.9 && ndS[i] < 0.06 && !(can && can[i])) { pf[i] = 1; pr[i] = rgb[j] / 255; pg[i] = rgb[j + 1] / 255; pb[i] = rgb[j + 2] / 255; }
-      const qm = boxMean(pf, w, h, rp), qr = boxMean(pr, w, h, rp), qg = boxMean(pg, w, h, rp), qb = boxMean(pb, w, h, rp), pale = new Uint8Array(n);
-      for (let i = 0, j = 0; i < n; i++, j += 4) {
-        if (m[i] || !hard[i] || !ok2(i) || (can && can[i]) || ndS[i] < 0.08 || qm[i] < 0.01 || (paved && paved[i])) continue;
-        const d = Math.abs(rgb[j] / 255 - qr[i] / qm[i]) + Math.abs(rgb[j + 1] / 255 - qg[i] / qm[i]) + Math.abs(rgb[j + 2] / 255 - qb[i] / qm[i]);
-        if (d > PALE) pale[i] = 1;
+      // The pavement's own colour is sampled within ~12 ft (so a dark roof or a different drive further off does not
+      // blur it) from flagged pixels that are grey - concrete, asphalt and stone have almost no colour, dormant turf
+      // is tan. Every flagged pixel is then either that colour (pavement) or clearly not (turf), pixel by pixel,
+      // which puts the lawn's edge exactly on the edge of the concrete, however narrow the walk.
+      // Light pavement (concrete) and dark pavement (asphalt) are sampled separately: with a street and a walk both
+      // close by, their average is about the brightness of turf and would tell nothing.
+      // Weathered asphalt can be as bright as turf, so the comparison also weighs how tan the pixel is (turf) against
+      // how grey the pavement is. In deep shadow colour says little; there the pixel only has to differ from the
+      // pavement around it taken together.
+      const hp = S.hardP, rp = Math.round(12 * ppf), pale = new Uint8Array(n), rim = new Uint8Array(n), qm = new Float32Array(n), far = new Uint8Array(n).fill(1);
+      const ar = new Float32Array(n), ag = new Float32Array(n), ab = new Float32Array(n);
+      for (const light of [true, false]) {
+        const pf = new Float32Array(n), pr = new Float32Array(n), pg = new Float32Array(n), pb = new Float32Array(n);
+        for (let i = 0, j = 0; i < n; i++, j += 4) { const sum = rgb[j] + rgb[j + 1] + rgb[j + 2]; if (hp[i] > 0.9 && (sum >= 480) === light && (rgb[j] - rgb[j + 2]) < GREY * sum && !(bld && bld[i]) && !(can && can[i])) { pf[i] = 1; pr[i] = rgb[j] / 255; pg[i] = rgb[j + 1] / 255; pb[i] = rgb[j + 2] / 255; } }
+        const km = boxMean(pf, w, h, rp), kr = boxMean(pr, w, h, rp), kg = boxMean(pg, w, h, rp), kb = boxMean(pb, w, h, rp);
+        for (let i = 0, j = 0; i < n; i++, j += 4) {
+          qm[i] += km[i]; ar[i] += kr[i]; ag[i] += kg[i]; ab[i] += kb[i];
+          if (km[i] < 0.01) continue;
+          const R = rgb[j] / 255, G = rgb[j + 1] / 255, B = rgb[j + 2] / 255, cr = kr[i] / km[i], cg = kg[i] / km[i], cb = kb[i] / km[i];
+          const tanner = Math.abs((R - B) / (R + G + B + 0.02) - (cr - cb) / (cr + cg + cb + 0.02));
+          if (Math.abs(R - cr) + Math.abs(G - cg) + Math.abs(B - cb) + 4 * tanner <= PALE) far[i] = 0;   // this is that pavement's colour
+        }
+      }
+      for (let i = 0, j = 0; i < n; i++, j += 4) if (qm[i] >= 0.01 && rgb[j] + rgb[j + 1] + rgb[j + 2] < 300)
+        far[i] = Math.abs(rgb[j] / 255 - ar[i] / qm[i]) + Math.abs(rgb[j + 1] / 255 - ag[i] / qm[i]) + Math.abs(rgb[j + 2] / 255 - ab[i] / qm[i]) > 0.2 ? 1 : 0;
+      for (let i = 0; i < n; i++) {
+        if (!hard[i] || !ok2(i) || (can && can[i]) || qm[i] < 0.01 || (paved && paved[i]) || !far[i] || (byHouse && byHouse[i])) continue;   // (not the planting beds against the house)
+        if (ndS[i] >= 0.08) pale[i] = 1; else rim[i] = 1;
+      }
+      // The summer photo is coarse: the few feet of turf right beside a walk read bare in it. Those count too, where
+      // they sit within 4 ft of turf that passed and are the same colour as it (a patio of another stone is not).
+      {
+        const r4 = Math.max(2, Math.round(4 * ppf)), tf = new Float32Array(n), tr = new Float32Array(n), tg = new Float32Array(n), tb = new Float32Array(n);
+        for (let i = 0, j = 0; i < n; i++, j += 4) if (pale[i]) { tf[i] = 1; tr[i] = rgb[j] / 255; tg[i] = rgb[j + 1] / 255; tb[i] = rgb[j + 2] / 255; }
+        const um = boxMean(tf, w, h, r4), ur = boxMean(tr, w, h, r4), ug = boxMean(tg, w, h, r4), ub = boxMean(tb, w, h, r4);
+        for (let i = 0, j = 0; i < n; i++, j += 4) if (rim[i] && um[i] > 0.05 && Math.abs(rgb[j] / 255 - ur[i] / um[i]) + Math.abs(rgb[j + 1] / 255 - ug[i] / um[i]) + Math.abs(rgb[j + 2] / 255 - ub[i] / um[i]) < 0.15) pale[i] = 1;
       }
       if (LM.keep) S.pale = pale;
       grow(j => pale[j], Math.round(15 * ppf), 200, ok2);
+      // Between the lawn and that strip there is often a band the model was merely unsure of. Now that the turf by
+      // the walk is known, match colours again within reach of the pavement and carry the lawn across, twice over.
+      for (let it = 0; it < 2; it++) { snapTo(qm); grow(j => pale[j], Math.round(15 * ppf), 200, ok2); }
     }
     m = morph(morph(m, w, h, r, true), w, h, r, false);
     blobs(m, w, h, 0, (p, cnt, border) => {   // fill leftover pinholes, but not ones that are mostly hard surface
@@ -1090,15 +1126,33 @@ function detect() {
     }
   }
   biggest = 0; blobs(m, w, h, 1, (p, cnt) => { if (cnt > biggest) biggest = cnt; });
+  const roadside = [];
   blobs(m, w, h, 1, (p, cnt) => {
     let conf = 0, sh = 0, fr = 0; for (let k = 0; k < p.length; k += 4) { conf += P[p[k]]; sh += shadeYard[p[k]] || treeYard[p[k]]; fr += frontAcc[p[k]]; }
-    if (fr > p.length / 8 && cnt * px >= 150) return;   // the strip between a sidewalk and the street is small and stands alone
     if (sh > p.length / 8 && cnt * px >= 400) return;   // a shaded yard by the house was judged on its own evidence above
     // drop patches that are small next to the main lawn, or that were built almost entirely out of shadow and weak
     // evidence (the fringe of the woods) rather than ground the model actually recognised as turf
     //    Anything other than the main lawn has to be clearly turf (average confidence 72%+) to be kept at all.
-    if (cnt * px < Math.min(biggest * px * 0.05, SMALL) || cnt * px < 200 || (cnt < biggest && conf / Math.ceil(p.length / 4) < (bySummer ? CONF : 0.65))) for (const i of p) m[i] = 0;
+    if (!(cnt * px < Math.min(biggest * px * 0.05, SMALL) || cnt * px < 200 || (cnt < biggest && conf / Math.ceil(p.length / 4) < (bySummer ? CONF : 0.65)))) return;
+    // (a patch on the road frontage - a shaded front yard, the strip between a sidewalk and the street - is small and
+    //  stands alone; it is judged just below. Every 4th pixel is sampled, so this is an eighth of the patch.)
+    if (fr > p.length / 32 && cnt * px >= 150) { roadside.push(p); return; }
+    for (const i of p) m[i] = 0;
   });
+  // A frontage patch stays if it is by the house or beside lawn that stood on its own - not a bit of verge along the
+  // road in front of the lot's woods.
+  if (roadside.length) {
+    const solid = m.slice(); for (const p of roadside) for (const i of p) solid[i] = 0;
+    const beside = morph(solid, w, h, Math.round(10 * ppf), true);
+    let house = null, dHouse = null;
+    if (bld) { const inLot = new Uint8Array(n); for (let i = 0; i < n; i++) inLot[i] = bld[i] && inP[i] ? 1 : 0; blobs(inLot, w, h, 1, p => { if (!house || p.length > house.length) house = p; }); }
+    if (house && house.length * px >= 300) { const own = new Uint8Array(n); for (const i of house) own[i] = 1; dHouse = distMap(own, w, h).d; }
+    for (const p of roadside) {
+      let keep = false;
+      for (let k = 0; k < p.length && !keep; k += 3) { const i = p[k]; keep = !!beside[i] || (dHouse ? dHouse[i] <= 40 * ppf : !!S.front && Math.hypot(i % w - S.front.hx, Math.floor(i / w) - S.front.hy) <= 60 * ppf); }
+      if (!keep) for (const i of p) m[i] = 0;
+    }
+  }
   // long straight sides: the outline may move up to `smooth` feet, but never onto a building or the middle of pavement
   stage('drop6', m);
   const pre = m; m = straighten(m, w, h, Math.min(smooth * 0.75, EPS) * ppf);
